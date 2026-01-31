@@ -561,14 +561,11 @@ def display_segments(segments: list) -> None:
                 print(RESET, end='', flush=True)
                 current_emotion = None
 
-        # Convert ellipsis to variable dots (2, 4, or 5 - never 3 to avoid infinite loop)
-        dot_counts = [2, 4, 5]
-        while "…" in text:
-            dots = "." * random.choice(dot_counts)
-            text = text.replace("…", dots, 1)
-        while "..." in text:
-            dots = "." * random.choice(dot_counts)
-            text = text.replace("...", dots, 1)
+        # Convert ellipsis to variable dots using regex (replace all at once to avoid infinite loop)
+        def random_dots(match):
+            return "." * random.choice([2, 4, 5])
+        text = re.sub(r'…', random_dots, text)
+        text = re.sub(r'\.{3,}', random_dots, text)  # 3+ dots → random 2/4/5
 
         # Display character by character with timing
         display_tone = streamer.get_tone()
