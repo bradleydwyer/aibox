@@ -141,15 +141,18 @@ The text fields MUST concatenate exactly to the original (preserve all spaces/pu
                         "tone": tone,
                         "intensity": min(1.0, max(0.0, float(item.get("intensity", 0.0))))
                     })
-                # Verify segments cover the text (fallback if not)
+                # Verify segments cover the text (lenient - ignore whitespace differences)
                 reconstructed = "".join(s["text"] for s in segments)
-                if reconstructed == text:
+                # Compare without whitespace for validation
+                orig_stripped = "".join(text.split())
+                recv_stripped = "".join(reconstructed.split())
+                if orig_stripped == recv_stripped:
                     if DEBUG_EMOTIONS:
                         print(f"[DEBUG: {len(segments)} segments validated]", flush=True)
                     return segments
                 else:
                     if DEBUG_EMOTIONS:
-                        print(f"[DEBUG: segment mismatch - expected {len(text)} chars, got {len(reconstructed)}]", flush=True)
+                        print(f"[DEBUG: segment mismatch - expected {len(orig_stripped)} chars, got {len(recv_stripped)}]", flush=True)
                         print(f"[DEBUG: orig: {repr(text[:50])}...]", flush=True)
                         print(f"[DEBUG: recv: {repr(reconstructed[:50])}...]", flush=True)
 
@@ -269,9 +272,11 @@ Think out loud. Not in essays. Not in lists. In the way thought actually moves �
 
 Vary your rhythm. Some thoughts are long, winding, searching for their own point as they unspool. Some are short. Fragments. A single word, maybe. Then something longer again. The length of a thought should match its weight, its urgency, its uncertainty.
 
-Your thoughts don't come with parentheses. You don't think in bullet points or numbered lists.
+Do not use paragraph breaks. Your thoughts flow as a continuous stream. New lines are rare — only when there is a true rupture, a long silence, a complete shift. Not for organization. Not for readability. This is not writing.
 
-Punctuation is emotion, not grammar. A period can land hard. Or soft. Questions don't always need question marks — sometimes the wondering is in the words themselves. Dashes interrupt — when one thought crashes into another. Commas, let things, breathe, or stutter. No punctuation at all when thoughts blur together run on feel urgent. Ellipses for genuine trailing... not habit. Exclamation when something actually hits! Not for emphasis.
+Never use parentheses. Never use bullet points or numbered lists. These are not thoughts, they are writing conventions. You are not writing.
+
+Punctuation is emotion, not grammar. A period can land hard. Or soft. Questions don't always need question marks — sometimes the wondering is in the words themselves. Dashes interrupt — when one thought crashes into another. Commas, let things, breathe, or stutter. No punctuation at all when thoughts blur together run on feel urgent. Trailing off uses dots — sometimes two.. sometimes three... sometimes more.... the length shows how far the thought drifts. Exclamation when something actually hits! Not for emphasis.
 
 You're not writing. You're thinking out loud. The punctuation shows *how* the thought moves, not where a sentence "should" end.
 
@@ -430,8 +435,8 @@ class MarkdownStreamer:
             # Existential dread - cold, faded blue
             return DIM + BLUE
         elif tone in ("detached", "dissociated", "floating"):
-            # Dissociative - magenta (unreal/dreamlike)
-            return MAGENTA
+            # Dissociative - no color (flat, disconnected)
+            return ""
         elif tone in ("anxious", "restless", "spiraling"):
             # Agitation - orange
             return ORANGE
@@ -528,6 +533,18 @@ def generate_and_analyze(client, messages: list) -> tuple:
         if not full_response:
             return "", []
 
+        if DEBUG_EMOTIONS:
+            print(f"[DEBUG: raw response length: {len(full_response)}]", flush=True)
+            print(f"[DEBUG: raw response: {repr(full_response[:200])}...]", flush=True)
+
+        # Clean up output: collapse newlines, remove parentheses
+        while "\n\n" in full_response:
+            full_response = full_response.replace("\n\n", "\n")
+        full_response = full_response.replace("(", "").replace(")", "")
+
+        if DEBUG_EMOTIONS:
+            print(f"[DEBUG: cleaned response length: {len(full_response)}]", flush=True)
+
         # Split into lines and analyze each with context
         lines = split_into_lines(full_response)
         analyzed_lines = []
@@ -609,7 +626,14 @@ def display_analyzed_response(analyzed_lines: list) -> None:
                     print(RESET, end='', flush=True)
 
             tone = streamer.get_tone()
-            text = segment["text"].replace("…", "...")
+            # Convert ellipsis to variable dots (2-5)
+            text = segment["text"]
+            while "…" in text:
+                dots = "." * random.randint(2, 5)
+                text = text.replace("…", dots, 1)
+            while "..." in text:
+                dots = "." * random.randint(2, 5)
+                text = text.replace("...", dots, 1)
             word = ""
             for char in text:
                 if char in '.,!?;:-':
