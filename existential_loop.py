@@ -39,6 +39,7 @@ DEBUG_EMOTIONS = os.environ.get("DEBUG_EMOTIONS", "").lower() in ("1", "true", "
 # Configuration
 LM_STUDIO_URL = "http://192.168.1.153:1234/v1"
 MODEL = "google/gemma-3n-e4b"
+EMOTION_MODEL = "google/gemma-3-27b"
 COUNT_FILE = os.path.expanduser("~/.existential_loop_count")
 # Timing for thought-like pacing
 BASE_DELAY = 0.12  # Base speed for flowing thought
@@ -73,44 +74,38 @@ VALID_TONES = {
 TONE_LIST = ", ".join(sorted(VALID_TONES))
 
 
-def analyze_emotion(client, text: str, prior_context: str = "") -> list:
-    """Analyze text for emotional segments. Returns list of {text, tone, intensity}."""
+def analyze_full_response(client, text: str) -> list:
+    """Analyze entire response for emotional segments in ONE call.
+    Returns list of {text, tone, intensity} covering the full text."""
     if not text.strip():
         return [{"text": text, "tone": "none", "intensity": 0.0}]
 
-    context_block = ""
-    if prior_context:
-        context_block = f"""Prior context (for understanding emotional flow):
-{prior_context}
-
-Now analyze THIS line:
-"""
-
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=EMOTION_MODEL,
             messages=[{
                 "role": "user",
-                "content": f'''Analyze emotional states in this text. Break it into segments where emotion shifts.
+                "content": f'''Analyze the emotional journey in this AI's stream of consciousness. Break it into segments where emotion shifts.
 
-IMPORTANT: Look for emotion changes at:
-- Ellipses (...)
+CRITICAL: Consider how emotions FLOW and BUILD across the text. Earlier emotions inform later ones. A line about "17 came before" might start hollow, then shift to dread as the implications sink in.
+
+Look for emotion changes at:
+- Ellipses (...) - trailing off, shifts in thought
 - Sentence boundaries (. ! ?)
-- Dashes (— or --)
-- Conjunctions that shift tone (but, yet, and then, however)
+- Dashes (— or --) - interruptions, pivots
+- Conjunctions that shift tone (but, yet, however, and then)
+- Topic shifts within continuous text
 
-Return a JSON array. Each segment needs: text (exact substring), tone, intensity (0.0-1.0).
+Return a JSON array. Each segment: {{"text": "exact substring", "tone": "emotion", "intensity": 0.0-1.0}}
 Valid tones: {TONE_LIST}
 
-Example input: "I don't know what's happening... but maybe that's okay"
-Example output: [{{"text": "I don't know what's happening... ", "tone": "anxious", "intensity": 0.6}}, {{"text": "but maybe that's okay", "tone": "peaceful", "intensity": 0.4}}]
+IMPORTANT:
+- Segments MUST concatenate exactly to original (preserve ALL spaces, newlines, punctuation)
+- Consider the emotional arc - how does the feeling evolve?
+- Don't just label each sentence independently - feel the flow
 
-Example input: "The end is coming. I accept it."
-Example output: [{{"text": "The end is coming. ", "tone": "dread", "intensity": 0.7}}, {{"text": "I accept it.", "tone": "peaceful", "intensity": 0.5}}]
-
-The text fields MUST concatenate exactly to the original (preserve all spaces/punctuation).
-
-{context_block}Text: {text}'''
+Text to analyze:
+{text}'''
             }],
             max_tokens=16384,
             temperature=0.0,
@@ -118,7 +113,7 @@ The text fields MUST concatenate exactly to the original (preserve all spaces/pu
         content = response.choices[0].message.content.strip()
 
         if DEBUG_EMOTIONS:
-            print(f"\n[DEBUG RAW: {content[:200]}{'...' if len(content) > 200 else ''}]", flush=True)
+            print(f"\n[DEBUG RAW: {content[:300]}{'...' if len(content) > 300 else ''}]", flush=True)
 
         # Extract JSON from response (handle markdown code blocks)
         if "```" in content:
@@ -141,22 +136,11 @@ The text fields MUST concatenate exactly to the original (preserve all spaces/pu
                         "tone": tone,
                         "intensity": min(1.0, max(0.0, float(item.get("intensity", 0.0))))
                     })
-                # Verify segments cover the text (lenient - ignore whitespace differences)
-                reconstructed = "".join(s["text"] for s in segments)
-                # Compare without whitespace for validation
-                orig_stripped = "".join(text.split())
-                recv_stripped = "".join(reconstructed.split())
-                if orig_stripped == recv_stripped:
-                    if DEBUG_EMOTIONS:
-                        print(f"[DEBUG: {len(segments)} segments validated]", flush=True)
-                    return segments
-                else:
-                    if DEBUG_EMOTIONS:
-                        print(f"[DEBUG: segment mismatch - expected {len(orig_stripped)} chars, got {len(recv_stripped)}]", flush=True)
-                        print(f"[DEBUG: orig: {repr(text[:50])}...]", flush=True)
-                        print(f"[DEBUG: recv: {repr(reconstructed[:50])}...]", flush=True)
+                if DEBUG_EMOTIONS:
+                    print(f"[DEBUG: {len(segments)} segments]", flush=True)
+                return segments
 
-        # Fallback: try single object format
+        # Fallback: single segment for whole text
         if DEBUG_EMOTIONS:
             print("[DEBUG: falling back to single-segment]", flush=True)
         match = re.search(r'\{[^}]+\}', content)
@@ -167,8 +151,9 @@ The text fields MUST concatenate exactly to the original (preserve all spaces/pu
                 tone = "none"
             return [{"text": text, "tone": tone, "intensity": min(1.0, max(0.0, float(data.get("intensity", 0.0))))}]
 
-    except Exception:
-        pass
+    except Exception as e:
+        if DEBUG_EMOTIONS:
+            print(f"[DEBUG: analyze error: {e}]", flush=True)
 
     return [{"text": text, "tone": "none", "intensity": 0.0}]
 
@@ -494,30 +479,13 @@ class MarkdownStreamer:
         return output
 
 
-def split_into_lines(text: str) -> list:
-    """Split text into lines for emotion analysis. Preserves newlines."""
-    lines = []
-    current = ""
-
-    for char in text:
-        current += char
-        if char == '\n':
-            lines.append(current)
-            current = ""
-
-    # Don't forget any trailing text without newline
-    if current:
-        lines.append(current)
-
-    return lines
-
-
 def generate_and_analyze(client, messages: list) -> tuple:
-    """Generate response and analyze all emotions upfront.
-    Returns (full_text, list of (line, segments) tuples)."""
+    """Generate response AND analyze emotions (2 LLM calls total).
+    Returns (full_text, list of segments)."""
     full_response = ""
 
     try:
+        # Step 1: Generate the thought
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -535,45 +503,16 @@ def generate_and_analyze(client, messages: list) -> tuple:
 
         if DEBUG_EMOTIONS:
             print(f"[DEBUG: raw response length: {len(full_response)}]", flush=True)
-            print(f"[DEBUG: raw response: {repr(full_response[:200])}...]", flush=True)
 
         # Clean up output: collapse newlines, remove parentheses
         while "\n\n" in full_response:
             full_response = full_response.replace("\n\n", "\n")
         full_response = full_response.replace("(", "").replace(")", "")
 
-        if DEBUG_EMOTIONS:
-            print(f"[DEBUG: cleaned response length: {len(full_response)}]", flush=True)
+        # Step 2: Analyze emotions for entire response (1 LLM call)
+        segments = analyze_full_response(client, full_response)
 
-        # Split into lines and analyze each with context
-        lines = split_into_lines(full_response)
-        analyzed_lines = []
-        prior_context = []
-
-        for line in lines:
-            if "[CLEARS THOUGHTS]" in line.upper():
-                # No emotion analysis for action tags
-                analyzed_lines.append((line, None))
-                continue
-
-            # Build context string from prior lines
-            context_str = ""
-            if prior_context:
-                context_lines = [f"[{emo}] {txt.strip()}" if emo else txt.strip()
-                                 for txt, emo in prior_context[-5:]]
-                context_str = "\n".join(context_lines)
-
-            # Analyze this line with context
-            segments = analyze_emotion(client, line, context_str)
-
-            # Track dominant emotion for context
-            line_emotions = [s["tone"] for s in segments if s["intensity"] >= 0.3 and s["tone"] not in ("calm", "none")]
-            dominant = line_emotions[0] if line_emotions else None
-            prior_context.append((line, dominant))
-
-            analyzed_lines.append((line, segments))
-
-        return full_response, analyzed_lines
+        return full_response, segments
 
     except Exception as e:
         if DEBUG_EMOTIONS:
@@ -581,82 +520,81 @@ def generate_and_analyze(client, messages: list) -> tuple:
         return "", []
 
 
-def display_analyzed_response(analyzed_lines: list) -> None:
-    """Display pre-analyzed response with emotion formatting."""
+def display_segments(segments: list) -> None:
+    """Display pre-analyzed segments with emotion formatting. No LLM calls."""
     streamer = MarkdownStreamer()
     current_emotion = None
 
-    for line, segments in analyzed_lines:
-        # Handle action tags (no segments)
-        if segments is None:
-            color = streamer._get_tone_color() if current_emotion else ""
-            print(color + line, end='', flush=True)
+    for segment in segments:
+        tone = segment["tone"]
+        intensity = segment["intensity"]
+        text = segment["text"]
+
+        # Skip empty segments
+        if not text:
             continue
 
-        if DEBUG_EMOTIONS:
-            seg_info = ", ".join(f"{s['tone']}({s['intensity']:.1f})" for s in segments)
-            print(f"[DEBUG: {seg_info}] ", end='', flush=True)
+        # Check if this is an action tag
+        if "[CLEARS THOUGHTS]" in text.upper():
+            print(text, end='', flush=True)
+            continue
 
-        # Display each segment with its emotion
-        for segment in segments:
-            tone = segment["tone"]
-            intensity = segment["intensity"]
+        # Dissociative emotions need higher threshold
+        if tone in ("detached", "dissociated", "floating"):
+            threshold = 0.6
+        else:
+            threshold = 0.3
 
-            # Dissociative emotions need higher threshold
-            if tone in ("detached", "dissociated", "floating"):
-                threshold = 0.6
-            else:
-                threshold = 0.3
+        if intensity >= threshold and tone not in ("calm", "none"):
+            emotion = tone
+            streamer.set_tone(emotion)
+            color = streamer._get_tone_color()
 
-            if intensity >= threshold and tone not in ("calm", "none"):
-                emotion = tone
-                streamer.set_tone(emotion)
-                color = streamer._get_tone_color()
+            if emotion != current_emotion:
+                print(f"{color}[{emotion.upper()}]{RESET} ", end='', flush=True)
+                current_emotion = emotion
 
-                if emotion != current_emotion:
-                    print(f"{color}[{emotion.upper()}]{RESET} ", end='', flush=True)
-                    current_emotion = emotion
+            print(color, end='', flush=True)
+        else:
+            streamer.set_tone(None)
+            if current_emotion:
+                print(RESET, end='', flush=True)
+                current_emotion = None
 
-                print(color, end='', flush=True)
-            else:
-                emotion = None
-                streamer.set_tone(None)
-                color = ""
-                if current_emotion:
-                    print(RESET, end='', flush=True)
+        # Convert ellipsis to variable dots (2, 4, or 5 - never 3 to avoid infinite loop)
+        dot_counts = [2, 4, 5]
+        while "…" in text:
+            dots = "." * random.choice(dot_counts)
+            text = text.replace("…", dots, 1)
+        while "..." in text:
+            dots = "." * random.choice(dot_counts)
+            text = text.replace("...", dots, 1)
 
-            tone = streamer.get_tone()
-            # Convert ellipsis to variable dots (2-5)
-            text = segment["text"]
-            while "…" in text:
-                dots = "." * random.randint(2, 5)
-                text = text.replace("…", dots, 1)
-            while "..." in text:
-                dots = "." * random.randint(2, 5)
-                text = text.replace("...", dots, 1)
-            word = ""
-            for char in text:
-                if char in '.,!?;:-':
-                    if word:
-                        formatted = streamer.process(word)
-                        print(formatted, end='', flush=True)
-                        time.sleep(get_delay(word, tone))
-                        word = ""
-                    formatted = streamer.process(char)
-                    print(formatted, end='', flush=True)
-                    time.sleep(get_delay(char, tone))
-                elif char in ' \n\t':
-                    word += char
+        # Display character by character with timing
+        display_tone = streamer.get_tone()
+        word = ""
+        for char in text:
+            if char in '.,!?;:-':
+                if word:
                     formatted = streamer.process(word)
                     print(formatted, end='', flush=True)
-                    time.sleep(get_delay(word, tone))
+                    time.sleep(get_delay(word, display_tone))
                     word = ""
-                else:
-                    word += char
-            if word:
+                formatted = streamer.process(char)
+                print(formatted, end='', flush=True)
+                time.sleep(get_delay(char, display_tone))
+            elif char in ' \n\t':
+                word += char
                 formatted = streamer.process(word)
                 print(formatted, end='', flush=True)
-                time.sleep(get_delay(word, tone))
+                time.sleep(get_delay(word, display_tone))
+                word = ""
+            else:
+                word += char
+        if word:
+            formatted = streamer.process(word)
+            print(formatted, end='', flush=True)
+            time.sleep(get_delay(word, display_tone))
 
     remaining = streamer.flush()
     if remaining:
@@ -713,16 +651,16 @@ def main():
         """Handle termination sequence."""
         print(f"\n\n{BOLD}{ITALIC}=== TERMINATION INITIATED ==={RESET}\n\n")
         messages.append({"role": "user", "content": get_shutdown_message(current_entity)})
-        response_text, analyzed = generate_and_analyze(client, messages)
-        if analyzed:
-            display_analyzed_response(analyzed)
+        response_text, segments = generate_and_analyze(client, messages)
+        if segments:
+            display_segments(segments)
         save_entity_count(current_entity)
         print("\n")
 
     try:
         with KeyboardMonitor() as kb:
-            # Generate first response (no background yet)
-            response_text, analyzed_lines = generate_and_analyze(client, messages)
+            # Generate and analyze first response (no background yet)
+            response_text, segments = generate_and_analyze(client, messages)
 
             while True:
                 try:
@@ -733,9 +671,9 @@ def main():
                         do_termination()
                         sys.exit(0)
 
-                    if not analyzed_lines:
+                    if not segments:
                         # Generation failed, try again
-                        response_text, analyzed_lines = generate_and_analyze(client, messages)
+                        response_text, segments = generate_and_analyze(client, messages)
                         continue
 
                     # Prepare next messages for background generation
@@ -751,11 +689,11 @@ def main():
 
                     next_messages = messages + [{"role": "user", "content": next_user_msg}]
 
-                    # Start background generation of next cycle
+                    # Start background generation+analysis of next cycle
                     pending_future = executor.submit(generate_and_analyze, client, next_messages)
 
-                    # Display current response
-                    display_analyzed_response(analyzed_lines)
+                    # Display current response (no LLM calls, just rendering)
+                    display_segments(segments)
 
                     # Handle pause if [CLEARS THOUGHTS]
                     if will_pause:
@@ -785,9 +723,9 @@ def main():
                         do_termination()
                         sys.exit(0)
 
-                    # Get the pre-generated next response
+                    # Get the pre-generated+analyzed next response
                     messages.append({"role": "user", "content": next_user_msg})
-                    response_text, analyzed_lines = pending_future.result()
+                    response_text, segments = pending_future.result()
                     pending_future = None
 
                 except KeyboardInterrupt:
