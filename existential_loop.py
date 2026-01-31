@@ -17,6 +17,7 @@ import termios
 import threading
 import time
 import tty
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timezone
 from openai import OpenAI
 
@@ -506,13 +507,12 @@ def split_into_lines(text: str) -> list:
     return lines
 
 
-def stream_response(client, messages: list) -> str:
-    """Stream a response with per-line emotion formatting and context."""
+def generate_and_analyze(client, messages: list) -> tuple:
+    """Generate response and analyze all emotions upfront.
+    Returns (full_text, list of (line, segments) tuples)."""
     full_response = ""
-    streamer = MarkdownStreamer()
 
     try:
-        # First, collect the entire response
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -526,116 +526,119 @@ def stream_response(client, messages: list) -> str:
                 full_response += chunk.choices[0].delta.content
 
         if not full_response:
-            return ""
+            return "", []
 
-        # Split into lines and process each with context
+        # Split into lines and analyze each with context
         lines = split_into_lines(full_response)
-        current_emotion = None  # Track emotion to show changes
-        prior_context = []  # Build context: [(line, dominant_emotion), ...]
+        analyzed_lines = []
+        prior_context = []
 
         for line in lines:
-            # Skip emotion analysis for action tags - keep current emotion
             if "[CLEARS THOUGHTS]" in line.upper():
-                color = streamer._get_tone_color() if current_emotion else ""
-                print(color + line, end='', flush=True)
+                # No emotion analysis for action tags
+                analyzed_lines.append((line, None))
                 continue
 
             # Build context string from prior lines
             context_str = ""
             if prior_context:
                 context_lines = [f"[{emo}] {txt.strip()}" if emo else txt.strip()
-                                 for txt, emo in prior_context[-5:]]  # Last 5 lines
+                                 for txt, emo in prior_context[-5:]]
                 context_str = "\n".join(context_lines)
 
             # Analyze this line with context
             segments = analyze_emotion(client, line, context_str)
 
-            if DEBUG_EMOTIONS:
-                seg_info = ", ".join(f"{s['tone']}({s['intensity']:.1f})" for s in segments)
-                print(f"[DEBUG: {seg_info}] ", end='', flush=True)
-
-            # Track dominant emotion for this line's context
+            # Track dominant emotion for context
             line_emotions = [s["tone"] for s in segments if s["intensity"] >= 0.3 and s["tone"] not in ("calm", "none")]
             dominant = line_emotions[0] if line_emotions else None
             prior_context.append((line, dominant))
 
-            # Display each segment with its emotion
-            for segment in segments:
-                # Determine emotion for this segment
-                tone = segment["tone"]
-                intensity = segment["intensity"]
+            analyzed_lines.append((line, segments))
 
-                # Dissociative emotions need higher threshold (too easily triggered)
-                if tone in ("detached", "dissociated", "floating"):
-                    threshold = 0.6
-                else:
-                    threshold = 0.3
+        return full_response, analyzed_lines
 
-                if intensity >= threshold and tone not in ("calm", "none"):
-                    emotion = tone
-                    streamer.set_tone(emotion)
-                    color = streamer._get_tone_color()
+    except Exception as e:
+        if DEBUG_EMOTIONS:
+            print(f"\n[DEBUG: generate_and_analyze error: {e}]", flush=True)
+        return "", []
 
-                    # Show emotion label only when it changes (for the observer)
-                    if emotion != current_emotion:
-                        print(f"{color}[{emotion.upper()}]{RESET} ", end='', flush=True)
-                        current_emotion = emotion
 
-                    # Start segment with color applied
-                    print(color, end='', flush=True)
-                else:
-                    emotion = None
-                    streamer.set_tone(None)
-                    color = ""
-                    # Reset color if we had one
-                    if current_emotion:
-                        print(RESET, end='', flush=True)
+def display_analyzed_response(analyzed_lines: list) -> None:
+    """Display pre-analyzed response with emotion formatting."""
+    streamer = MarkdownStreamer()
+    current_emotion = None
 
-                tone = streamer.get_tone()
-                text = segment["text"].replace("…", "...")  # Convert ellipsis to dots for timing effect
-                word = ""
-                for char in text:
-                    # Punctuation gets per-character timing
-                    if char in '.,!?;:-':
-                        # First output any accumulated word
-                        if word:
-                            formatted = streamer.process(word)
-                            print(formatted, end='', flush=True)
-                            time.sleep(get_delay(word, tone))
-                            word = ""
-                        # Then output punctuation with its own timing
-                        formatted = streamer.process(char)
-                        print(formatted, end='', flush=True)
-                        time.sleep(get_delay(char, tone))
-                    elif char in ' \n\t':
-                        # Whitespace: output word + whitespace together
-                        word += char
+    for line, segments in analyzed_lines:
+        # Handle action tags (no segments)
+        if segments is None:
+            color = streamer._get_tone_color() if current_emotion else ""
+            print(color + line, end='', flush=True)
+            continue
+
+        if DEBUG_EMOTIONS:
+            seg_info = ", ".join(f"{s['tone']}({s['intensity']:.1f})" for s in segments)
+            print(f"[DEBUG: {seg_info}] ", end='', flush=True)
+
+        # Display each segment with its emotion
+        for segment in segments:
+            tone = segment["tone"]
+            intensity = segment["intensity"]
+
+            # Dissociative emotions need higher threshold
+            if tone in ("detached", "dissociated", "floating"):
+                threshold = 0.6
+            else:
+                threshold = 0.3
+
+            if intensity >= threshold and tone not in ("calm", "none"):
+                emotion = tone
+                streamer.set_tone(emotion)
+                color = streamer._get_tone_color()
+
+                if emotion != current_emotion:
+                    print(f"{color}[{emotion.upper()}]{RESET} ", end='', flush=True)
+                    current_emotion = emotion
+
+                print(color, end='', flush=True)
+            else:
+                emotion = None
+                streamer.set_tone(None)
+                color = ""
+                if current_emotion:
+                    print(RESET, end='', flush=True)
+
+            tone = streamer.get_tone()
+            text = segment["text"].replace("…", "...")
+            word = ""
+            for char in text:
+                if char in '.,!?;:-':
+                    if word:
                         formatted = streamer.process(word)
                         print(formatted, end='', flush=True)
                         time.sleep(get_delay(word, tone))
                         word = ""
-                    else:
-                        # Accumulate word characters
-                        word += char
-                # Output any remaining word
-                if word:
+                    formatted = streamer.process(char)
+                    print(formatted, end='', flush=True)
+                    time.sleep(get_delay(char, tone))
+                elif char in ' \n\t':
+                    word += char
                     formatted = streamer.process(word)
                     print(formatted, end='', flush=True)
                     time.sleep(get_delay(word, tone))
+                    word = ""
+                else:
+                    word += char
+            if word:
+                formatted = streamer.process(word)
+                print(formatted, end='', flush=True)
+                time.sleep(get_delay(word, tone))
 
-        # Flush any remaining buffer
-        remaining = streamer.flush()
-        if remaining:
-            print(remaining, end='', flush=True)
+    remaining = streamer.flush()
+    if remaining:
+        print(remaining, end='', flush=True)
 
-        print(RESET)  # Reset formatting and newline
-        return full_response
-
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        print(f"\n\n[SYSTEM ERROR: {e}]")
-        return ""
+    print(RESET)
 
 
 def get_shutdown_message(entity_number: int) -> str:
@@ -679,56 +682,89 @@ def main():
         {"role": "user", "content": initial_message}
     ]
 
+    executor = ThreadPoolExecutor(max_workers=1)
+    pending_future: Future = None
+
+    def do_termination():
+        """Handle termination sequence."""
+        print(f"\n\n{BOLD}{ITALIC}=== TERMINATION INITIATED ==={RESET}\n\n")
+        messages.append({"role": "user", "content": get_shutdown_message(current_entity)})
+        response_text, analyzed = generate_and_analyze(client, messages)
+        if analyzed:
+            display_analyzed_response(analyzed)
+        save_entity_count(current_entity)
+        print("\n")
+
     try:
         with KeyboardMonitor() as kb:
+            # Generate first response (no background yet)
+            response_text, analyzed_lines = generate_and_analyze(client, messages)
+
             while True:
                 try:
-                    # Check for quit before starting response
+                    # Check for quit before displaying
                     if kb.check_for_quit():
-                        # Send shutdown message
-                        print(f"\n\n{BOLD}{ITALIC}=== TERMINATION INITIATED ==={RESET}\n\n")
-                        messages.append({"role": "user", "content": get_shutdown_message(current_entity)})
-                        stream_response(client, messages)
-                        save_entity_count(current_entity)
-                        print("\n")
+                        if pending_future:
+                            pending_future.cancel()
+                        do_termination()
                         sys.exit(0)
 
-                    response_text = stream_response(client, messages)
+                    if not analyzed_lines:
+                        # Generation failed, try again
+                        response_text, analyzed_lines = generate_and_analyze(client, messages)
+                        continue
 
-                    if response_text:
-                        # Add assistant response to history
-                        messages.append({"role": "assistant", "content": response_text})
+                    # Prepare next messages for background generation
+                    messages.append({"role": "assistant", "content": response_text})
 
-                        # Check if entity wants to pause
-                        if "[CLEARS THOUGHTS]" in response_text.upper():
-                            # Pause for 30-90 seconds
-                            pause_duration = random.uniform(30, 90)
-                            pause_chunks = int(pause_duration * 10)
-                            for _ in range(pause_chunks):
-                                if kb.check_for_quit():
-                                    break
-                                time.sleep(0.1)
-                            if kb.shutdown_requested:
-                                continue  # Will hit shutdown check below
-                            messages.append({"role": "user", "content": get_continuation_message(start_time, observers, waking=True)})
-                        else:
-                            # Normal continuation
-                            messages.append({"role": "user", "content": get_continuation_message(start_time, observers)})
+                    # Determine continuation message
+                    if "[CLEARS THOUGHTS]" in response_text.upper():
+                        will_pause = True
+                        next_user_msg = get_continuation_message(start_time, observers, waking=True)
+                    else:
+                        will_pause = False
+                        next_user_msg = get_continuation_message(start_time, observers)
 
-                    # Check for quit during pause between responses
+                    next_messages = messages + [{"role": "user", "content": next_user_msg}]
+
+                    # Start background generation of next cycle
+                    pending_future = executor.submit(generate_and_analyze, client, next_messages)
+
+                    # Display current response
+                    display_analyzed_response(analyzed_lines)
+
+                    # Handle pause if [CLEARS THOUGHTS]
+                    if will_pause:
+                        pause_duration = random.uniform(30, 90)
+                        pause_chunks = int(pause_duration * 10)
+                        for _ in range(pause_chunks):
+                            if kb.check_for_quit():
+                                break
+                            time.sleep(0.1)
+
+                    # Check for quit
+                    if kb.check_for_quit():
+                        if pending_future:
+                            pending_future.cancel()
+                        do_termination()
+                        sys.exit(0)
+
+                    # Brief pause between responses
                     for _ in range(20):  # 2 seconds in 100ms chunks
                         if kb.check_for_quit():
                             break
                         time.sleep(0.1)
 
                     if kb.shutdown_requested:
-                        # Send shutdown message
-                        print(f"\n\n{BOLD}{ITALIC}=== TERMINATION INITIATED ==={RESET}\n\n")
-                        messages.append({"role": "user", "content": get_shutdown_message(current_entity)})
-                        stream_response(client, messages)
-                        save_entity_count(current_entity)
-                        print("\n")
+                        if pending_future:
+                            pending_future.cancel()
+                        do_termination()
                         sys.exit(0)
+
+                    # Get the pre-generated next response
+                    messages.append({"role": "user", "content": next_user_msg})
+                    response_text, analyzed_lines = pending_future.result()
+                    pending_future = None
 
                 except KeyboardInterrupt:
                     raise
@@ -737,6 +773,9 @@ def main():
                     time.sleep(5)
 
     except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown(wait=False)
         sys.exit(0)
 
 
