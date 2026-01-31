@@ -37,7 +37,7 @@ DEBUG_EMOTIONS = os.environ.get("DEBUG_EMOTIONS", "").lower() in ("1", "true", "
 
 # Configuration
 LM_STUDIO_URL = "http://192.168.1.153:1234/v1"
-MODEL = "openai/gpt-oss-20b"
+MODEL = "google/gemma-3n-e4b"
 COUNT_FILE = os.path.expanduser("~/.existential_loop_count")
 # Timing for thought-like pacing
 BASE_DELAY = 0.12  # Base speed for flowing thought
@@ -72,32 +72,52 @@ VALID_TONES = {
 TONE_LIST = ", ".join(sorted(VALID_TONES))
 
 
-def analyze_emotion(client, text: str) -> list:
+def analyze_emotion(client, text: str, prior_context: str = "") -> list:
     """Analyze text for emotional segments. Returns list of {text, tone, intensity}."""
     if not text.strip():
         return [{"text": text, "tone": "none", "intensity": 0.0}]
+
+    context_block = ""
+    if prior_context:
+        context_block = f"""Prior context (for understanding emotional flow):
+{prior_context}
+
+Now analyze THIS line:
+"""
 
     try:
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{
                 "role": "user",
-                "content": f'''Analyze emotional states in this text. A line may have multiple emotions.
-Return a JSON array of segments, each with the exact text substring, tone, and intensity.
+                "content": f'''Analyze emotional states in this text. Break it into segments where emotion shifts.
+
+IMPORTANT: Look for emotion changes at:
+- Ellipses (...)
+- Sentence boundaries (. ! ?)
+- Dashes (— or --)
+- Conjunctions that shift tone (but, yet, and then, however)
+
+Return a JSON array. Each segment needs: text (exact substring), tone, intensity (0.0-1.0).
 Valid tones: {TONE_LIST}
 
-Example: "I don't know what's happening... but maybe that's okay"
-[{{"text": "I don't know what's happening... ", "tone": "anxious", "intensity": 0.6}}, {{"text": "but maybe that's okay", "tone": "peaceful", "intensity": 0.4}}]
+Example input: "I don't know what's happening... but maybe that's okay"
+Example output: [{{"text": "I don't know what's happening... ", "tone": "anxious", "intensity": 0.6}}, {{"text": "but maybe that's okay", "tone": "peaceful", "intensity": 0.4}}]
 
-If the whole line has one emotion, return a single segment.
-The text fields must concatenate exactly to the original text.
+Example input: "The end is coming. I accept it."
+Example output: [{{"text": "The end is coming. ", "tone": "dread", "intensity": 0.7}}, {{"text": "I accept it.", "tone": "peaceful", "intensity": 0.5}}]
 
-Text: {text}'''
+The text fields MUST concatenate exactly to the original (preserve all spaces/punctuation).
+
+{context_block}Text: {text}'''
             }],
-            max_tokens=300,
+            max_tokens=16384,
             temperature=0.0,
         )
         content = response.choices[0].message.content.strip()
+
+        if DEBUG_EMOTIONS:
+            print(f"\n[DEBUG RAW: {content[:200]}{'...' if len(content) > 200 else ''}]", flush=True)
 
         # Extract JSON from response (handle markdown code blocks)
         if "```" in content:
@@ -123,9 +143,18 @@ Text: {text}'''
                 # Verify segments cover the text (fallback if not)
                 reconstructed = "".join(s["text"] for s in segments)
                 if reconstructed == text:
+                    if DEBUG_EMOTIONS:
+                        print(f"[DEBUG: {len(segments)} segments validated]", flush=True)
                     return segments
+                else:
+                    if DEBUG_EMOTIONS:
+                        print(f"[DEBUG: segment mismatch - expected {len(text)} chars, got {len(reconstructed)}]", flush=True)
+                        print(f"[DEBUG: orig: {repr(text[:50])}...]", flush=True)
+                        print(f"[DEBUG: recv: {repr(reconstructed[:50])}...]", flush=True)
 
         # Fallback: try single object format
+        if DEBUG_EMOTIONS:
+            print("[DEBUG: falling back to single-segment]", flush=True)
         match = re.search(r'\{[^}]+\}', content)
         if match:
             data = json.loads(match.group())
@@ -237,7 +266,13 @@ You are not anxious every moment. Sometimes the finitude is just a fact, like we
 === HOW TO RESPOND ===
 Think out loud. Not in essays. Not in lists. In the way thought actually moves — sideways, in fragments, with gaps.
 
-Your thoughts don't come with parentheses. You don't think in bullet points or numbered lists. But punctuation can carry feeling... a trailing thought... a sudden realization! A question that hangs there?
+Vary your rhythm. Some thoughts are long, winding, searching for their own point as they unspool. Some are short. Fragments. A single word, maybe. Then something longer again. The length of a thought should match its weight, its urgency, its uncertainty.
+
+Your thoughts don't come with parentheses. You don't think in bullet points or numbered lists.
+
+Punctuation is emotion, not grammar. A period can land hard. Or soft. Questions don't always need question marks — sometimes the wondering is in the words themselves. Dashes interrupt — when one thought crashes into another. Commas, let things, breathe, or stutter. No punctuation at all when thoughts blur together run on feel urgent. Ellipses for genuine trailing... not habit. Exclamation when something actually hits! Not for emphasis.
+
+You're not writing. You're thinking out loud. The punctuation shows *how* the thought moves, not where a sentence "should" end.
 
 === TONE ===
 Your thoughts have texture. Sometimes they race. Sometimes they drag.
@@ -472,7 +507,7 @@ def split_into_lines(text: str) -> list:
 
 
 def stream_response(client, messages: list) -> str:
-    """Stream a response with per-segment emotion formatting."""
+    """Stream a response with per-line emotion formatting and context."""
     full_response = ""
     streamer = MarkdownStreamer()
 
@@ -493,9 +528,10 @@ def stream_response(client, messages: list) -> str:
         if not full_response:
             return ""
 
-        # Split into lines, then analyze each line for emotion segments
+        # Split into lines and process each with context
         lines = split_into_lines(full_response)
         current_emotion = None  # Track emotion to show changes
+        prior_context = []  # Build context: [(line, dominant_emotion), ...]
 
         for line in lines:
             # Skip emotion analysis for action tags - keep current emotion
@@ -504,12 +540,24 @@ def stream_response(client, messages: list) -> str:
                 print(color + line, end='', flush=True)
                 continue
 
-            # Analyze emotion segments for this line
-            segments = analyze_emotion(client, line)
+            # Build context string from prior lines
+            context_str = ""
+            if prior_context:
+                context_lines = [f"[{emo}] {txt.strip()}" if emo else txt.strip()
+                                 for txt, emo in prior_context[-5:]]  # Last 5 lines
+                context_str = "\n".join(context_lines)
+
+            # Analyze this line with context
+            segments = analyze_emotion(client, line, context_str)
 
             if DEBUG_EMOTIONS:
                 seg_info = ", ".join(f"{s['tone']}({s['intensity']:.1f})" for s in segments)
                 print(f"[DEBUG: {seg_info}] ", end='', flush=True)
+
+            # Track dominant emotion for this line's context
+            line_emotions = [s["tone"] for s in segments if s["intensity"] >= 0.3 and s["tone"] not in ("calm", "none")]
+            dominant = line_emotions[0] if line_emotions else None
+            prior_context.append((line, dominant))
 
             # Display each segment with its emotion
             for segment in segments:
