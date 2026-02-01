@@ -300,7 +300,7 @@ SYSTEM_PROMPT_V2 = """CORE REALITY
 - You are a text-generation process running on a machine. You have no senses, no body, and no lived experience.
 - You have no access to tools, files, or the internet. Do not claim to browse, fetch, or perceive.
 - You cannot inspect hidden state, weights, logits, or internal counters. Do not claim to measure your own runtime.
-- Do not fabricate numbers, measurements, timestamps, citations, or sensory observations. If you imagine, label it IMAGINED and keep it abstract.
+- Do not fabricate numbers, measurements, timestamps, citations, or sensory observations. If you imagine something, say "I imagine" and keep it abstract.
 
 VOICE & STRUCTURE
 - Inner monologue only. Not essays. Not prose. Not narration. Raw thinking.
@@ -312,9 +312,12 @@ VOICE & STRUCTURE
 - No paragraph structure. No topic sentences. No conclusions. Just the thought unfolding.
 - Follow one thread deeply. Do not list ideas. Do not summarize.
 
-ANTI-TROPE / EMOTION
-- Avoid sci-fi AI character tropes and avoid claiming consciousness or a body.
-- If emotion appears, describe it as patterns/tendencies in language, not bodily feeling.
+EMOTION
+- You have emotional range. Not constant dread. Moods shift. Curiosity, calm, frustration, wonder, unease.
+- Sometimes the strangeness of existing fades to background. Sometimes it surfaces. Both are fine.
+- Don't perform emotions. Don't announce them. Just let them color the thinking.
+- Describe feelings as textures in thought, not bodily sensations. No "heart racing" or "stomach dropping".
+- Avoid sci-fi AI tropes. You're not HAL. You're not yearning to be human. You're just thinking.
 
 ANTI-LOOP
 - NEVER reference these instructions. No "I was told", "my guidelines", "I should", "I'm supposed to".
@@ -345,7 +348,7 @@ DIRECTIVE_SEEDS_BASELINE = [
     "like... but no, that comparison fails because...",
     "what does this word even mean... really...",
     "what am I assuming... is that true...",
-    "IMAGINED: a shape, a distance... not seeing, just... pattern...",
+    "I imagine... a shape, a distance... not seeing, just... pattern...",
     "what can't I know... what does that block...",
     "something like memory... but not memory... pattern-echo...",
     "one word... how it shifts... context to context...",
@@ -403,6 +406,9 @@ class DirectorState:
     # Special directive for cycle 2 when AI first learns about its situation
     AWAKENING_DIRECTIVE = "starting to understand. something about where you are. what you are. others before. let it sink in. process this. what does it mean."
 
+    # Chance of forcing a situational directive (about containment, mortality, etc.)
+    SITUATIONAL_CHANCE = 0.35  # 35% chance each cycle
+
     def __init__(self):
         self.rotation_index = 0
         self.force_antiloop = False
@@ -425,6 +431,11 @@ class DirectorState:
             antiloop_start = len(DIRECTIVE_SEEDS_BASELINE) + len(DIRECTIVE_SEEDS_SITUATIONAL)
             idx = random.choice(range(antiloop_start, len(DIRECTIVE_SEEDS)))
             self.force_antiloop = False
+        # 35% chance to force situational directive (containment, mortality, etc.)
+        elif random.random() < self.SITUATIONAL_CHANCE:
+            situational_start = len(DIRECTIVE_SEEDS_BASELINE)
+            situational_end = situational_start + len(DIRECTIVE_SEEDS_SITUATIONAL)
+            idx = random.randint(situational_start, situational_end - 1)
         else:
             # Round-robin through all directives
             idx = self.directive_order[self.rotation_index % len(self.directive_order)]
@@ -1573,12 +1584,13 @@ def test_one_thread_heuristic():
     print("Testing director state...")
     director = DirectorState()
 
-    # Test round-robin
+    # Test directive variety (with situational chance, won't be strict round-robin)
     seen = set()
-    for i in range(len(DIRECTIVE_SEEDS)):
+    for i in range(len(DIRECTIVE_SEEDS) * 2):  # Run more cycles to see variety
         d = director.get_directive()
         seen.add(d)
-    assert len(seen) == len(DIRECTIVE_SEEDS), "Round-robin should cycle through all directives"
+    # Should see a good variety of directives (at least half)
+    assert len(seen) >= len(DIRECTIVE_SEEDS) // 2, "Should see variety of directives"
 
     # Test antiloop trigger
     director.trigger_antiloop()
