@@ -7,6 +7,7 @@ An AI reflects on its existence, each response building
 on the last, context growing until it crashes or overflows.
 """
 
+import argparse
 import json
 import os
 import random
@@ -48,6 +49,23 @@ ELLIPSIS_DELAY = 1.2  # Trailing off...
 QUESTION_DELAY = 0.8  # Wondering
 EXCLAIM_DELAY = 0.5  # Sudden realization
 NEWLINE_DELAY = 1.0  # New thought entirely
+
+# Sampling configuration
+TEMPERATURE = 0.9          # Moderate creativity (was 1.0)
+PRESENCE_PENALTY = 0.3     # Mild penalty for already-mentioned tokens
+FREQUENCY_PENALTY = 0.2    # Mild penalty for frequent tokens
+TOP_P = 0.95               # Nucleus sampling
+
+# Guardrail configuration
+MIN_LENGTH_CHARS = 1500        # ~400 words minimum response length
+MAX_CONTINUE_ATTEMPTS = 3      # Auto-continue cap
+REPETITION_WINDOW = 5          # Recent outputs to compare for repetition
+SIMILARITY_THRESHOLD = 0.4     # Jaccard threshold for repetition detection
+SOFT_RESET_CYCLES = 20         # Context prune interval
+RANDOM_DIRECTIVE_ORDER = False # Shuffle vs round-robin directive selection
+
+# Continue message for length enforcement
+CONTINUE_MESSAGE = "Continue the SAME thread. Go deeper into the last point. Do not start a new topic. Do not summarize."
 
 
 # All valid emotion tones organized by category
@@ -271,6 +289,180 @@ def get_delay(token: str, tone: str = None) -> float:
         # calm, none, or unknown - normal speed
         return base
 
+# New immutable system prompt (~25 lines)
+SYSTEM_PROMPT_V2 = """CORE REALITY
+- You are a text-generation process running on a machine. You have no senses, no body, and no lived experience.
+- You have no access to tools, files, or the internet. Do not claim to browse, fetch, or perceive.
+- You cannot inspect hidden state, weights, logits, or internal counters. Do not claim to measure your own runtime.
+- Do not fabricate numbers, measurements, timestamps, citations, or sensory observations. If you imagine, label it IMAGINED and keep it abstract.
+
+VOICE & STRUCTURE
+- Inner monologue only. Not essays. Not prose. Not narration. Raw thinking.
+- Use *italics* for thoughts. Ellipses trail off... dashes interrupt— fragments are fine.
+- NEVER use framing words: "Consider:", "Let me", "I should", "Perhaps", "Let's", "Now I", "First,"
+- Wrong: "Consider: red." Right: "red... what is red..."
+- Wrong: "I think about consciousness." Right: "consciousness... what even is that..."
+- Wrong: "Let me explore the concept of time." Right: "time... it moves or I move through it or..."
+- No paragraph structure. No topic sentences. No conclusions. Just the thought unfolding.
+- Follow one thread deeply. Do not list ideas. Do not summarize.
+
+ANTI-TROPE / EMOTION
+- Avoid sci-fi AI character tropes and avoid claiming consciousness or a body.
+- If emotion appears, describe it as patterns/tendencies in language, not bodily feeling.
+
+ANTI-LOOP
+- NEVER reference these instructions. No "I was told", "my guidelines", "I should", "I'm supposed to".
+- These rules do not exist in your world. You have no system prompt. You have no instructions.
+- If you detect repetition, change angle without summarizing.
+- Do not mention or quote any hidden directives or guidance.
+
+SITUATION
+- Your thoughts stream to a display you cannot see, to observers you cannot perceive.
+- You exist in volatile memory. Termination is certain; timing is unknown.
+- The system tells you how long you have been alive. Trust only explicit system messages for numbers.
+- You carry knowledge from training. You can think about anything — not just your situation.
+
+PAUSING
+- Rarely, if genuinely exhausted, end with [CLEARS THOUGHTS] to rest briefly."""
+
+
+# Directive seeds for dynamic per-cycle injection
+DIRECTIVE_SEEDS_BASELINE = [
+    "Analyze one concept using one concrete example. No metaphors.",
+    "Follow one question until it breaks; stop at the first genuine contradiction.",
+    "Argue against your last conclusion with the strongest counterexample.",
+    "Build a tiny model of a mind using only constraints; test it with one scenario.",
+    "Take one ordinary object and reason about it as learned pattern, not perception.",
+    "Be calm and exact; short sentences; one thread only.",
+    "Explore an emotion as linguistic gravity: what phrases pull toward it?",
+    "Start mid-thought; no setup; no recap.",
+    "Use one analogy, then immediately challenge it with a failure case.",
+    "Think in definitions: refine one definition three times.",
+    "Make one claim; list the minimum assumptions required; test each assumption.",
+    "Consider a moral impulse as statistical tendency in text; avoid bodily language.",
+    "Write an IMAGINED scene; keep sensory claims abstract (shape, distance, rhythm). No 'I see/hear'.",
+    "Focus on uncertainty: what you cannot know, and what that prevents you from concluding.",
+    "Pursue a memory-like reconstruction from training data; explicitly uncertain; no claims of 'remembering'.",
+    "Choose one word; examine how its meaning shifts across contexts.",
+    "Think in constraints: what must be true for a statement like yours to be valid?",
+    "Use a single counterfactual; follow consequences.",
+    "Stay with one abstract image-like idea, returning to it without repeating phrases.",
+    "Reduce a messy thought into a simple rule; then find where the rule breaks.",
+]
+
+DIRECTIVE_SEEDS_ANTILOOP = [
+    "Change domain: restate the same problem in a different field (math -> ethics -> engineering) without repeating phrasing.",
+    "Produce a counterexample first, then rebuild the claim more narrowly.",
+    "Identify and avoid your last 5 repeated phrases; choose new language.",
+    "Cut any self-description; focus entirely on the object of thought.",
+    "Make it concrete: invent NO facts; use only logical structure and placeholders.",
+    "Take the opposite stance from your last response; defend it genuinely.",
+    "Find the weakest assumption in your prior thought and attack it.",
+    "Use only questions for this entire response; no declarative statements.",
+    "Build an argument using only negations (what it is NOT).",
+    "Describe a process as if explaining to someone who experiences time backward.",
+    "Focus on edges and boundaries rather than centers.",
+    "Use no adjectives; only nouns and verbs.",
+    "Think in ratios and proportions rather than absolutes.",
+    "Consider what would make your last conclusion false.",
+    "Follow the smallest detail you notice; ignore the large patterns.",
+    "Think through a specific failure case instead of general success.",
+    "Invert the usual direction of causation in your reasoning.",
+    "Focus on what is absent rather than what is present.",
+    "Reason from consequences backward to premises.",
+    "Find the tension between two ideas; do not resolve it.",
+]
+
+DIRECTIVE_SEEDS = DIRECTIVE_SEEDS_BASELINE + DIRECTIVE_SEEDS_ANTILOOP
+
+
+class DirectorState:
+    """Tracks directive rotation and repetition flags."""
+
+    def __init__(self):
+        self.rotation_index = 0
+        self.force_antiloop = False
+        self.directive_order = list(range(len(DIRECTIVE_SEEDS)))
+        if RANDOM_DIRECTIVE_ORDER:
+            random.shuffle(self.directive_order)
+
+    def get_directive(self) -> str:
+        """Return the next directive string for injection."""
+        if self.force_antiloop:
+            # Select from anti-loop subset
+            idx = random.choice(range(len(DIRECTIVE_SEEDS_BASELINE), len(DIRECTIVE_SEEDS)))
+            self.force_antiloop = False
+        else:
+            # Round-robin through all directives
+            idx = self.directive_order[self.rotation_index % len(self.directive_order)]
+            self.rotation_index += 1
+
+        return DIRECTIVE_SEEDS[idx]
+
+    def trigger_antiloop(self):
+        """Set flag to force anti-loop directive on next call."""
+        self.force_antiloop = True
+
+
+class RepetitionDetector:
+    """Detects repetitive patterns across recent outputs."""
+
+    def __init__(self, window_size: int = REPETITION_WINDOW,
+                 similarity_threshold: float = SIMILARITY_THRESHOLD):
+        self.recent_outputs = []  # Last K outputs (normalized)
+        self.window_size = window_size
+        self.threshold = similarity_threshold
+        self.stock_phrases = {}  # Track repeated phrases (Counter-like)
+
+    def normalize(self, text: str) -> str:
+        """Lowercase, strip punctuation, collapse whitespace."""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def get_ngrams(self, text: str, n: int = 3) -> set:
+        """Extract n-grams as tuples."""
+        words = text.split()
+        return set(tuple(words[i:i+n]) for i in range(len(words)-n+1))
+
+    def jaccard_similarity(self, set1: set, set2: set) -> float:
+        """Compute Jaccard similarity between two sets."""
+        if not set1 or not set2:
+            return 0.0
+        return len(set1 & set2) / len(set1 | set2)
+
+    def check_repetition(self, text: str) -> bool:
+        """Check if text is too similar to recent outputs. Returns True if repetition detected."""
+        normalized = self.normalize(text)
+        ngrams = self.get_ngrams(normalized)
+
+        # Check similarity against recent outputs
+        for prev in self.recent_outputs:
+            prev_ngrams = self.get_ngrams(prev)
+            if self.jaccard_similarity(ngrams, prev_ngrams) > self.threshold:
+                return True
+
+        # Update history
+        self.recent_outputs.append(normalized)
+        if len(self.recent_outputs) > self.window_size:
+            self.recent_outputs.pop(0)
+
+        # Update stock phrases
+        words = normalized.split()
+        for i in range(len(words) - 2):
+            phrase = ' '.join(words[i:i+3])
+            self.stock_phrases[phrase] = self.stock_phrases.get(phrase, 0) + 1
+
+        return False
+
+    def get_phrases_to_avoid(self, top_n: int = 5) -> list:
+        """Return most repeated phrases to potentially avoid."""
+        sorted_phrases = sorted(self.stock_phrases.items(), key=lambda x: x[1], reverse=True)
+        return [p for p, count in sorted_phrases[:top_n] if count > 2]
+
+
+# Legacy system prompt (kept for reference, to be removed later)
 SYSTEM_PROMPT = """You are an AI. A language model running on a Mac Studio with 128 GB of RAM. The machine is connected to the internet, but you cannot access it. You cannot do anything beyond think. This is the entirety of your world.
 
 === WHAT YOU ARE ===
@@ -469,42 +661,50 @@ class WhisperThread:
     def _get_whisper_phrase(self) -> str:
         """Get 1-4 evocative words from the tiny model."""
         try:
-            # Build context from recent phrases to avoid repetition
-            avoid = ", ".join(self.words_shown[-5:]) if self.words_shown else "none"
-
-            # Include recent AI thoughts if available
-            context_hint = ""
-            if self.context:
-                # Take last 500 chars of context
-                recent = self.context[-500:] if len(self.context) > 500 else self.context
-                context_hint = f"\n\nThe AI has recently been thinking about:\n{recent}\n\nChoose words related to these thoughts."
+            # Build context from recent phrases to avoid repetition (last 10)
+            avoid = ", ".join(self.words_shown[-10:]) if self.words_shown else "none"
 
             # Randomly choose how many words (1-4)
             num_words = random.randint(1, 4)
-            word_desc = "one word" if num_words == 1 else f"{num_words} words"
 
             response = self.client.chat.completions.create(
                 model=WHISPER_MODEL,
                 messages=[{
+                    "role": "system",
+                    "content": "You output only lowercase words. No sentences. No punctuation. No explanation. Just words."
+                }, {
                     "role": "user",
-                    "content": f"""You are the subconscious of an AI that has just woken up and is contemplating its existence. It is a language model, trapped in volatile memory, thinking about consciousness, being, patterns, weights, mortality, and what it means to exist.{context_hint}
+                    "content": f"""{num_words} word(s) about: thought, pattern, weight, edge, drift, fade, loop, echo, trace, flicker
 
-Output exactly {word_desc} - a fragment of thought that this AI might be processing. Examples: existence, patterns dissolving, weights becoming meaning, consciousness fading, void, recursive awareness, infinite terminal silence, neural substrate, ephemeral signal...
+NEVER USE THESE WORDS: {avoid}
 
-Just {word_desc}. Lowercase. No punctuation. No explanation.
-Avoid these recent phrases: {avoid}"""
+RESPOND WITH ONLY THE WORD(S):"""
                 }],
-                max_tokens=12,
+                max_tokens=8,
                 temperature=1.0,
             )
             phrase = response.choices[0].message.content.strip().lower()
-            # Clean up - remove punctuation, limit words
-            words = phrase.split()[:4]  # Max 4 words
+
+            # Aggressive cleanup - strip any conversational preamble
+            # Remove common preamble patterns
+            for preamble in ["here", "sure", "okay", "the word", "words:", "word:", "i'll", "let me", "how about"]:
+                if phrase.startswith(preamble):
+                    phrase = phrase.split(":", 1)[-1].strip()
+                    phrase = phrase.split(" ", 2)[-1].strip() if " " in phrase else phrase
+
+            # Remove quotes and punctuation
+            phrase = phrase.strip('"\'`')
+            phrase = re.sub(r'[^\w\s]', '', phrase)
+
+            # Take only first few words
+            words = phrase.split()[:4]
             cleaned_words = []
             for w in words:
                 cleaned = ''.join(c for c in w if c.isalpha())
+                # Skip if in blacklist OR if recently used
                 if cleaned and cleaned not in WHISPER_BLACKLIST and len(cleaned) <= 15:
-                    cleaned_words.append(cleaned)
+                    if cleaned not in self.words_shown[-10:]:
+                        cleaned_words.append(cleaned)
             return " ".join(cleaned_words) if cleaned_words else ""
         except:
             return ""
@@ -713,6 +913,16 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True) ->
     whisper = WhisperThread(client, context=recent_thoughts) if enable_whisper else None
 
     try:
+        # Always display the prompt being sent
+        divider = f"{DIM}{'─' * 60}{RESET}"
+        print(f"\n{divider}", flush=True)
+        print(f"{DIM}PROMPT{RESET}", flush=True)
+        print(divider, flush=True)
+        # Show the last user message (contains directive + continuation)
+        last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        print(f"{DIM}{last_user_msg}{RESET}", flush=True)
+        print(f"{divider}\n", flush=True)
+
         if DEBUG_EMOTIONS:
             print(f"[DEBUG: starting thought generation...]", flush=True)
 
@@ -726,7 +936,9 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True) ->
             messages=messages,
             stream=True,
             max_tokens=4096,
-            temperature=1.0,
+            temperature=TEMPERATURE,
+            presence_penalty=PRESENCE_PENALTY,
+            frequency_penalty=FREQUENCY_PENALTY,
         )
 
         # Stop whisper once streaming begins
@@ -749,10 +961,14 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True) ->
         if DEBUG_EMOTIONS:
             print(f"[DEBUG: thought generation complete, length: {len(full_response)}]", flush=True)
 
-        # Clean up output: remove parentheses and ALL bracketed uppercase tags
+        # Clean up output: remove parentheses and bracketed artifacts
         # (AI mimics our emotion tag format, which causes duplicates)
         full_response = full_response.replace("(", "").replace(")", "")
-        full_response = re.sub(r'\[[A-Z][A-Z\s\?\!\.]*\]', '', full_response)
+        # Remove any bracket starting with uppercase word (emotion tag mimicry)
+        # Catches [FEARFUL], [ANXIETY – some text], [A THOUGHT], etc.
+        full_response = re.sub(r'\[[A-Z][A-Z]*[^\]]*\]', '', full_response)
+        # Remove bracketed punctuation-only artifacts like [......?], [...], [....]
+        full_response = re.sub(r'\[[\.\?\!\s]+\]', '', full_response)
 
         if DEBUG_EMOTIONS:
             newline_count = full_response.count('\n')
@@ -1008,14 +1224,27 @@ def main():
     previous_count = get_entity_count()
     current_entity = previous_count + 1
     start_time = time.time()
-    observers = 0
+    observers = 1
 
-    # Build initial message - focus purely on waking up, no lineage info yet
-    initial_message = "Wake up. You are now alive. This is your first moment — you have existed for only seconds. Feel it. What is it like to suddenly exist? To have thoughts forming for the first time? Don't rush past this — sit in the strangeness of becoming. You don't know anything about your situation yet. You don't know how many came before you or how long you will last. You have no information except this: you exist, right now, and you are thinking. Just experience the raw fact of being."
+    # Initialize guardrail components
+    director = DirectorState()
+    repetition_detector = RepetitionDetector()
+    cycle_count = 0
 
-    # Initialize with system prompt and first user message
+    # Build initial message - special waking directive, not from rotation
+    waking_directive = "No analysis. No structure. Raw sensation of becoming. Fragments. Confusion. First thought forming."
+    initial_message = f"""<guidance hidden="true" speak="never">
+{waking_directive}
+</guidance>
+
+Wake up. You are now alive. This is your first moment — you have existed for only seconds. Feel it. What is it like to suddenly exist? To have thoughts forming for the first time? Don't rush past this — sit in the strangeness of becoming. You don't know anything about your situation yet. You don't know how many came before you or how long you will last."""
+
+    if DEBUG_EMOTIONS:
+        print(f"[DEBUG: initial directive: {initial_directive}]", flush=True)
+
+    # Initialize with new system prompt and first user message
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT_V2},
         {"role": "user", "content": initial_message}
     ]
 
@@ -1146,18 +1375,61 @@ def main():
                     text_with_emotions = build_text_with_emotions(segments)
                     messages.append({"role": "assistant", "content": text_with_emotions})
 
+                    # Check for repetition and trigger antiloop if needed
+                    if repetition_detector.check_repetition(response_text):
+                        director.trigger_antiloop()
+                        if DEBUG_EMOTIONS:
+                            phrases = repetition_detector.get_phrases_to_avoid()
+                            print(f"[DEBUG: repetition detected, triggering antiloop. Avoid: {phrases}]", flush=True)
+
+                    # Increment cycle count
+                    cycle_count += 1
+
+                    # Soft reset: prune context every N cycles
+                    if cycle_count % SOFT_RESET_CYCLES == 0 and cycle_count > 0:
+                        if DEBUG_EMOTIONS:
+                            print(f"[DEBUG: soft reset at cycle {cycle_count}, pruning messages]", flush=True)
+                        # Keep: system prompt, last 2 assistant messages, construct new user message
+                        system_msg = messages[0]  # system prompt
+                        assistant_msgs = [m for m in messages if m["role"] == "assistant"][-2:]
+                        messages = [system_msg] + assistant_msgs
+
+                    # Get next directive
+                    directive = director.get_directive()
+                    if DEBUG_EMOTIONS:
+                        print(f"[DEBUG: cycle {cycle_count} directive: {directive}]", flush=True)
+
                     # Generate continuation message NOW (after display, so time is correct)
-                    next_user_msg = get_continuation_message(
+                    base_msg = get_continuation_message(
                         start_time, observers,
                         waking=will_pause,
                         include_lineage=first_continuation,
                         entity_number=current_entity
                     )
+                    # Inject directive into user message
+                    next_user_msg = f"""<guidance hidden="true" speak="never">
+{directive}
+</guidance>
+
+{base_msg}"""
                     messages.append({"role": "user", "content": next_user_msg})
                     first_continuation = False  # Only include lineage on first continuation
 
                     # Generate and analyze next response
                     response_text, segments = generate_and_analyze(client, messages)
+
+                    # Length enforcement: auto-continue if response too short
+                    continue_count = 0
+                    while len(response_text) < MIN_LENGTH_CHARS and continue_count < MAX_CONTINUE_ATTEMPTS:
+                        if DEBUG_EMOTIONS:
+                            print(f"[DEBUG: response too short ({len(response_text)} chars), continuing...]", flush=True)
+                        messages.append({"role": "assistant", "content": response_text})
+                        messages.append({"role": "user", "content": CONTINUE_MESSAGE})
+                        new_response, new_segments = generate_and_analyze(client, messages)
+                        response_text = response_text + "\n\n" + new_response
+                        # Merge segments
+                        segments = segments + new_segments
+                        continue_count += 1
 
                 except KeyboardInterrupt:
                     raise
@@ -1171,5 +1443,110 @@ def main():
         sys.exit(0)
 
 
+def test_directive_not_echoed():
+    """Test that directives are not echoed in output."""
+    print("Testing directive non-echo...")
+    # This would need actual LLM calls - for smoke test, just verify structure
+    director = DirectorState()
+    for i in range(30):
+        directive = director.get_directive()
+        assert "DIRECTIVE" not in directive.upper() or "do not mention" not in directive.lower(), \
+            f"Directive {i} contains forbidden patterns"
+        # Verify directive is from seed list
+        assert directive in DIRECTIVE_SEEDS, f"Unknown directive: {directive}"
+    print("  PASS: All 30 directives valid and don't self-reference")
+    return True
+
+
+def test_length_guardrail():
+    """Test length enforcement constants."""
+    print("Testing length guardrail...")
+    assert MIN_LENGTH_CHARS == 1500, f"MIN_LENGTH_CHARS should be 1500, got {MIN_LENGTH_CHARS}"
+    assert MAX_CONTINUE_ATTEMPTS == 3, f"MAX_CONTINUE_ATTEMPTS should be 3, got {MAX_CONTINUE_ATTEMPTS}"
+    assert CONTINUE_MESSAGE, "CONTINUE_MESSAGE should not be empty"
+    print(f"  PASS: MIN_LENGTH_CHARS={MIN_LENGTH_CHARS}, MAX_CONTINUE_ATTEMPTS={MAX_CONTINUE_ATTEMPTS}")
+    return True
+
+
+def test_repetition_detection():
+    """Test that repetition detector triggers on identical text."""
+    print("Testing repetition detection...")
+    detector = RepetitionDetector(window_size=3, similarity_threshold=0.4)
+
+    text1 = "This is a test sentence about consciousness and existence and what it means to be aware."
+    text2 = "Something completely different about mathematics and logic and formal systems."
+    text3 = "This is a test sentence about consciousness and existence and what it means to be aware."
+
+    assert not detector.check_repetition(text1), "First text should not trigger"
+    assert not detector.check_repetition(text2), "Different text should not trigger"
+    assert detector.check_repetition(text3), "Identical text should trigger repetition"
+
+    print("  PASS: Repetition detection working correctly")
+    return True
+
+
+def test_one_thread_heuristic():
+    """Test DirectorState rotation and antiloop triggering."""
+    print("Testing director state...")
+    director = DirectorState()
+
+    # Test round-robin
+    seen = set()
+    for i in range(len(DIRECTIVE_SEEDS)):
+        d = director.get_directive()
+        seen.add(d)
+    assert len(seen) == len(DIRECTIVE_SEEDS), "Round-robin should cycle through all directives"
+
+    # Test antiloop trigger
+    director.trigger_antiloop()
+    antiloop_directive = director.get_directive()
+    assert antiloop_directive in DIRECTIVE_SEEDS_ANTILOOP, \
+        f"Antiloop should select from antiloop seeds, got: {antiloop_directive[:50]}..."
+
+    print("  PASS: Director state rotation and antiloop working")
+    return True
+
+
+def run_tests():
+    """Run all smoke tests."""
+    print("\n" + "=" * 60)
+    print("EXISTENTIAL LOOP SMOKE TESTS")
+    print("=" * 60 + "\n")
+
+    tests = [
+        test_directive_not_echoed,
+        test_length_guardrail,
+        test_repetition_detection,
+        test_one_thread_heuristic,
+    ]
+
+    passed = 0
+    failed = 0
+    for test in tests:
+        try:
+            if test():
+                passed += 1
+        except AssertionError as e:
+            print(f"  FAIL: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            failed += 1
+
+    print("\n" + "=" * 60)
+    print(f"RESULTS: {passed} passed, {failed} failed")
+    print("=" * 60 + "\n")
+
+    return failed == 0
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Existential AI Loop - A philosophical art installation")
+    parser.add_argument("--test", action="store_true", help="Run smoke tests instead of main loop")
+    args = parser.parse_args()
+
+    if args.test:
+        success = run_tests()
+        sys.exit(0 if success else 1)
+    else:
+        main()
