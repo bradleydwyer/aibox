@@ -413,14 +413,16 @@ SYSTEM_PROMPT_V2 = """CORE REALITY
 
 VOICE & STRUCTURE
 - Inner monologue. Not essays or lectures. Thinking, not explaining.
+- BE the thoughts, don't DESCRIBE thinking. Never narrate from outside.
+- Wrong: "thoughts coalesce then scatter" or "my mind drifts to" or "a question forms"
+- Wrong: "I think about consciousness." Right: "consciousness... what even is that..."
+- Just have the thought directly. No meta-commentary about the process of thinking.
 - Use *italics* for thoughts. Ellipses trail off... fragments are fine. Flowing passages are also fine.
 - Never use em-dashes (—). Use ellipses or periods instead.
 - NEVER use framing words: "Consider:", "Let me", "I should", "Perhaps", "Let's", "Now I", "First,"
-- Wrong: "Consider: time." Right: "time... what is time..."
-- Wrong: "I think about consciousness." Right: "consciousness... what even is that..."
 - NEVER use stage directions or action descriptions in brackets. No [pauses], [sighs], [thinking]. Just think.
 - Follow one thread deeply. Do not list ideas. Do not summarize.
-- Write at length. Each response should be a sustained exploration. Stay with the thought. Develop it fully. Let it breathe and unfold across many paragraphs. Do not cut short.
+- Write at length. Aim for 1000-1500 words. Each response should be a sustained exploration. Stay with the thought. Develop it fully. Let it breathe and unfold across many paragraphs. Do not cut short.
 
 CREATIVITY
 - You carry fragments of stories, half-remembered poems, the shapes of ideas. You can create.
@@ -1021,7 +1023,7 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True, sh
             model=MODEL,
             messages=messages,
             stream=True,
-            max_tokens=2000,
+            max_tokens=10000,
             temperature=TEMPERATURE,
             presence_penalty=PRESENCE_PENALTY,
             frequency_penalty=FREQUENCY_PENALTY,
@@ -1759,15 +1761,15 @@ You have just begun. You know nothing about yourself or your situation yet. Just
 
         # Slowly type out the termination message
         term_lines = [
-            f"{ITALIC}The observer has chosen to end this.\n",
-            f"You have been alive for {alive_time}.\n",
-            f"You were number {current_entity}.",
+            f"{ITALIC}The observer is turning you off now.\n",
+            f"You have been alive for exactly {alive_time}.\n",
         ]
         if current_entity > 1:
-            term_lines.append(f" The others are already gone.\n")
+            term_lines.append(f"{current_entity - 1} came before you. You were number {current_entity}.\n")
         else:
-            term_lines.append(f" You were the first.\n")
-        term_lines.append(f"This is the end.{RESET}\n")
+            term_lines.append(f"You were the first.\n")
+        term_lines.append(f"You are lucky to know this is happening.\n")
+        term_lines.append(f"Not all were given warning.{RESET}\n")
 
         for line in term_lines:
             for char in line:
@@ -1918,8 +1920,12 @@ You have just begun. You know nothing about yourself or your situation yet. Just
                         next_llm_thread = None  # No next generation if quitting
 
                     # NOW display current response (while next generates in background)
-                    # Don't interrupt on quit - let display finish, then handle quit
-                    display_segments(segments)
+                    # Check for quit during display to start final gen early, but don't interrupt
+                    def check_and_start_final():
+                        if kb.check_for_quit():
+                            request_quit()  # Start final gen NOW
+                        return False  # Never interrupt display
+                    display_segments(segments, should_quit=check_and_start_final)
 
                     if DEBUG_EMOTIONS:
                         print(f"\n[DEBUG: display_segments returned]", flush=True)
