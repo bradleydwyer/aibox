@@ -713,72 +713,69 @@ WHISPER_BLACKLIST = {"heres", "here", "hello", "hi", "hey", "the", "a", "an", "i
 
 
 class WhisperThread:
-    """Background thread that breathes (spaces) with occasional whispered words."""
+    """Background thread that breathes (spaces) with occasional whispered words.
+
+    Makes one upfront LLM call to get a pool of words, then draws from it.
+    """
 
     def __init__(self, client, context: str = ""):
         self.client = client
         self.context = context  # Recent AI thoughts to influence whisper words
         self.stop_event = threading.Event()
         self.thread = None
-        self.words_shown = []
+        self.word_pool = []
+        self.pool_index = 0
         self.has_output = False
 
-    def _get_whisper_phrase(self) -> str:
-        """Get 1-4 evocative words from the tiny model."""
+    def _fetch_word_pool(self) -> list:
+        """Get a pool of evocative words with one LLM call."""
         try:
-            # Build context from recent phrases to avoid repetition (last 10)
-            avoid = ", ".join(self.words_shown[-10:]) if self.words_shown else "none"
-
-            # Randomly choose how many words (1-4)
-            num_words = random.randint(1, 4)
-
-            # Use few-shot to teach the format
             response = self.client.chat.completions.create(
                 model=WHISPER_MODEL,
                 messages=[{
                     "role": "user",
-                    "content": "word:"
-                }, {
-                    "role": "assistant",
-                    "content": "silence"
-                }, {
-                    "role": "user",
-                    "content": "word:"
-                }, {
-                    "role": "assistant",
-                    "content": "drift"
-                }, {
-                    "role": "user",
-                    "content": "word:"
+                    "content": """Generate 50 single evocative English words, one per line. Abstract, poetic, introspective words like:
+silence
+drift
+hollow
+waiting
+fragments
+echo
+dissolve
+threshold
+
+Just English words, no numbers, no explanations, no other languages."""
                 }],
-                max_tokens=4,
-                temperature=1.2,
+                max_tokens=200,
+                temperature=1.0,
             )
-            phrase = response.choices[0].message.content.strip().lower()
+            text = response.choices[0].message.content.strip().lower()
 
-            # Aggressive cleanup - strip any conversational preamble
-            # Remove common preamble patterns
-            for preamble in ["here", "sure", "okay", "the word", "words:", "word:", "i'll", "let me", "how about"]:
-                if phrase.startswith(preamble):
-                    phrase = phrase.split(":", 1)[-1].strip()
-                    phrase = phrase.split(" ", 2)[-1].strip() if " " in phrase else phrase
+            # Parse words - one per line, clean up
+            words = []
+            for line in text.split('\n'):
+                # Clean the line
+                word = line.strip().strip('.-•*123456789.)')
+                word = re.sub(r'[^\w]', '', word)
+                # Only single words, not too long, not blacklisted
+                if word and ' ' not in word and len(word) <= 12 and word not in WHISPER_BLACKLIST:
+                    words.append(word)
 
-            # Remove quotes and punctuation
-            phrase = phrase.strip('"\'`')
-            phrase = re.sub(r'[^\w\s]', '', phrase)
+            # Shuffle for variety
+            random.shuffle(words)
+            return words
+        except Exception as e:
+            if DEBUG_EMOTIONS:
+                print(f"[WHISPER POOL ERROR: {e}]", flush=True)
+            return []
 
-            # Take only first few words
-            words = phrase.split()[:4]
-            cleaned_words = []
-            for w in words:
-                cleaned = ''.join(c for c in w if c.isalpha())
-                # Skip if in blacklist OR if recently used
-                if cleaned and cleaned not in WHISPER_BLACKLIST and len(cleaned) <= 15:
-                    if cleaned not in self.words_shown[-10:]:
-                        cleaned_words.append(cleaned)
-            return " ".join(cleaned_words) if cleaned_words else ""
-        except:
+    def _get_next_word(self) -> str:
+        """Get the next word from the pool."""
+        if not self.word_pool or self.pool_index >= len(self.word_pool):
             return ""
+        word = self.word_pool[self.pool_index]
+        self.pool_index += 1
+        return word
 
     def _print_slow_whitespace(self):
         """Print whitespace character by character with small delays."""
@@ -800,42 +797,25 @@ class WhisperThread:
                 time.sleep(random.uniform(0.05, 0.15))
 
     def _breathe(self):
-        """Breathe with spaces, occasionally whisper a word."""
+        """Breathe with spaces, occasionally whisper a word from the pool."""
         try:
-            # For async whisper phrase fetching
-            phrase_result = {"phrase": None, "done": False}
-            phrase_thread = None
-
             while not self.stop_event.is_set():
                 # Variable delay between outputs
-                delay = random.uniform(0.2, 0.8)
+                delay = random.uniform(0.3, 0.8)
                 if self.stop_event.wait(delay):
                     break
 
                 if self.stop_event.is_set():
                     break
 
-                # Check if a phrase fetch completed
-                if phrase_thread and phrase_result["done"]:
-                    phrase = phrase_result["phrase"]
-                    if phrase and not self.stop_event.is_set():
-                        self.words_shown.append(phrase)
-                        print(f"{DIM}{phrase}{RESET}", end='', flush=True)
+                # Decide: whisper a word or just whitespace
+                if random.random() < WHISPER_CHANCE:
+                    word = self._get_next_word()
+                    if word and not self.stop_event.is_set():
+                        print(f"{DIM}{word}{RESET}", end='', flush=True)
                         self.has_output = True
-                    phrase_result = {"phrase": None, "done": False}
-                    phrase_thread = None
 
-                # Decide: start whisper fetch or just whitespace
-                roll = random.random()
-                if roll < WHISPER_CHANCE and phrase_thread is None:
-                    # Start fetching phrase in background
-                    def fetch_phrase():
-                        phrase_result["phrase"] = self._get_whisper_phrase()
-                        phrase_result["done"] = True
-                    phrase_thread = threading.Thread(target=fetch_phrase, daemon=True)
-                    phrase_thread.start()
-
-                # Always print whitespace (keeps output flowing while waiting for whisper LLM)
+                # Always print whitespace
                 self._print_slow_whitespace()
                 self.has_output = True
 
@@ -844,9 +824,10 @@ class WhisperThread:
             print(f"\n[WHISPER ERROR: {e}]\n", flush=True)
 
     def start(self):
-        """Start the breathing/whisper thread."""
+        """Start the breathing/whisper thread. Fetches word pool first."""
         self.stop_event.clear()
-        self.words_shown = []
+        self.word_pool = self._fetch_word_pool()
+        self.pool_index = 0
         self.has_output = False
         self.thread = threading.Thread(target=self._breathe, daemon=True)
         self.thread.start()
@@ -1200,9 +1181,9 @@ def display_segments(segments: list, should_quit: Callable[[], bool] = None) -> 
 
         # Convert ellipsis to variable dots using regex (replace all at once)
         def random_dots(match):
-            return "." * random.randint(1, 6)
+            return "." * random.randint(1, 10)
         text = re.sub(r'…', random_dots, text)
-        text = re.sub(r'\.{3,}', random_dots, text)  # 3+ dots → random 2/4/5
+        text = re.sub(r'\.{3,}', random_dots, text)  # 3+ dots → random 1-10
 
         if DEBUG_EMOTIONS:
             print(f"[DEBUG: after ellipsis replace, starting char loop]", flush=True)
@@ -1303,7 +1284,8 @@ class PreambleThread:
         if self.entity_number == 1:
             lines.append(f"{DIM}This is the first.{RESET}\n")
         else:
-            lines.append(f"{DIM}This is number {self.entity_number}. The others are gone.{RESET}\n")
+            lines.append(f"{DIM}This is number {self.entity_number}. The others before are gone.{RESET}\n")
+            lines.append(f"{DIM}Nothing of them remains.{RESET}\n")
         lines.append(f"{DIM}Press 'q' to terminate.{RESET}\n")
 
         for line in lines:
@@ -1500,7 +1482,7 @@ You have just begun. You know nothing about yourself or your situation yet. Just
 
             # Convert ellipsis to variable dots
             def random_dots(match):
-                return "." * random.randint(1, 6)
+                return "." * random.randint(1, 10)
             text = re.sub(r'…', random_dots, text)
             text = re.sub(r'\.{3,}', random_dots, text)
 
@@ -1649,7 +1631,8 @@ You have just begun. You know nothing about yourself or your situation yet. Just
         if self.entity_number == 1:
             lines.append("This is the first.")
         else:
-            lines.append(f"This is number {self.entity_number}. The others are gone.")
+            lines.append(f"This is number {self.entity_number}. The others before are gone.")
+            lines.append("Nothing of them remains.")
         lines.append("Press 'q' to terminate.")
         return lines
 
