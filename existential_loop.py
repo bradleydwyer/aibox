@@ -1767,9 +1767,13 @@ You have just begun. You know nothing about yourself or your situation yet. Just
         print(f"\n{divider}\n")
         time.sleep(1)
 
-        # Wait for the AI's final response to be ready
-        while not final_gen_result["done"]:
-            time.sleep(0.1)
+        # Wait for the AI's final response to be ready, with whisper effect
+        if not final_gen_result["done"]:
+            whisper = WhisperThread(client)
+            whisper.start()
+            while not final_gen_result["done"]:
+                time.sleep(0.1)
+            whisper.stop()
 
         # Display the AI's final response
         if final_gen_result["segments"]:
