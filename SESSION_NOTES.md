@@ -113,6 +113,44 @@ An AI art installation where an AI reflects on its existence. Thoughts stream to
 - `[CLEARS THOUGHTS]` is rare - only when genuinely exhausted
 - **Variety in output**: Not limited to existential reflection. Can compose prose, verse, fiction fragments. Can wander through abstract ideas (beauty, time, language). Can surface memory-fragments from training data. Existential awareness is part of it but not all of it.
 
+## WhisperThread (Subconscious)
+- Generates contemplative phrases during LLM wait times
+- Uses tiny model: "gemma-3-270m-it-mlx"
+- 60% chance of phrase vs whitespace on each cycle
+- Outputs 1-4 words per phrase (randomly chosen)
+- Context-aware: includes recent AI thoughts to influence word choice
+- Blacklist of common/boring words
+- Variable whitespace between outputs (character by character)
+- Occasional newlines (~12% chance) with random indent
+
+## PreambleThread
+- Types out intro while first LLM generates
+- Divider lines print instantly
+- Text types character by character with delays
+- Shows entity number and lineage summary
+
+## Termination Display
+- Similar styled output to preamble
+- Shows lifetime and entity number
+- AI gets final response to termination message
+
+## Initial Message Flow
+- First message: Pure waking experience ("you exist, right now")
+- No lineage info in first message
+- Lineage info (how many came before) in second continuation message
+- Prevents AI from jumping past the waking-up experience
+
+## Three-Model Architecture
+- MODEL: "google/gemma-3-27b" (main thoughts)
+- EMOTION_MODEL: "google/gemma-3n-e4b" (emotion analysis)
+- WHISPER_MODEL: "gemma-3-270m-it-mlx" (subconscious phrases)
+
+## Background LLM Generation
+- First LLM call runs in background thread
+- Preamble types while LLM generates
+- After preamble finishes, whisper runs until LLM completes
+- Allows visual activity during all wait times
+
 ## Bugs Fixed This Session
 1. **Infinite loop in ellipsis replacement** - `randint(2,5)` could return 3, replacing "..." with "..." forever. Also replacing with 4 or 5 dots still contains "...". Fixed with regex `re.sub` to replace all at once.
 
@@ -125,3 +163,9 @@ An AI art installation where an AI reflects on its existence. Thoughts stream to
 5. **Wrong time in continuation** - Background pre-generation captured time before display finished. Fixed by removing pre-generation, making flow sequential.
 
 6. **[DETACHED] showing in blue** - Previous color not reset before printing emotion label. Fixed by adding RESET before color code.
+
+7. **AI not focusing on waking up** - Moved lineage info to second message, made first message purely about the raw experience of coming into existence.
+
+8. **Whisper not appearing after preamble** - LLM generation was blocking. Fixed by running LLM in background thread, starting whisper after preamble finishes.
+
+9. **Duplicate text in segments** - Emotion model returning overlapping segments. Fixed with deduplication logic and skipping unfound segments.
