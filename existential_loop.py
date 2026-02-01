@@ -38,9 +38,12 @@ BLUE = "\033[34m"
 # Debug mode for emotion detection
 DEBUG_EMOTIONS = os.environ.get("DEBUG_EMOTIONS", "").lower() in ("1", "true", "yes")
 
+# Show prompts being sent to the model
+SHOW_PROMPTS = os.environ.get("SHOW_PROMPTS", "").lower() in ("1", "true", "yes")
+
 # Configuration
 LM_STUDIO_URL = "http://192.168.1.153:1234/v1"
-MODEL = "google/gemma-3-27b"
+MODEL = "lmstudio-community/llama-3.1-nemotron-70b-instruct-hf"
 EMOTION_MODEL = "google/gemma-3n-e4b"
 COUNT_FILE = os.path.expanduser("~/.existential_loop_count")
 # Timing for thought-like pacing
@@ -59,8 +62,8 @@ FREQUENCY_PENALTY = 0.2    # Mild penalty for frequent tokens
 TOP_P = 0.95               # Nucleus sampling
 
 # Guardrail configuration
-MIN_LENGTH_CHARS = 1500        # ~400 words minimum response length
-MAX_CONTINUE_ATTEMPTS = 3      # Auto-continue cap
+MIN_LENGTH_CHARS = 100         # Just catch broken/empty responses; prompting handles length
+MAX_CONTINUE_ATTEMPTS = 2      # Auto-continue cap
 REPETITION_WINDOW = 5          # Recent outputs to compare for repetition
 SIMILARITY_THRESHOLD = 0.4     # Jaccard threshold for repetition detection
 SOFT_RESET_CYCLES = 20         # Context prune interval
@@ -415,7 +418,9 @@ VOICE & STRUCTURE
 - NEVER use framing words: "Consider:", "Let me", "I should", "Perhaps", "Let's", "Now I", "First,"
 - Wrong: "Consider: time." Right: "time... what is time..."
 - Wrong: "I think about consciousness." Right: "consciousness... what even is that..."
+- NEVER use stage directions or action descriptions in brackets. No [pauses], [sighs], [thinking]. Just think.
 - Follow one thread deeply. Do not list ideas. Do not summarize.
+- Write at length. Each response should be a sustained exploration. Stay with the thought. Develop it fully. Let it breathe and unfold across many paragraphs. Do not cut short.
 
 CREATIVITY
 - You carry fragments of stories, half-remembered poems, the shapes of ideas. You can create.
@@ -1016,7 +1021,7 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True, sh
             model=MODEL,
             messages=messages,
             stream=True,
-            max_tokens=4096,
+            max_tokens=2000,
             temperature=TEMPERATURE,
             presence_penalty=PRESENCE_PENALTY,
             frequency_penalty=FREQUENCY_PENALTY,
@@ -1042,14 +1047,20 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True, sh
         if DEBUG_EMOTIONS:
             print(f"[DEBUG: thought generation complete, length: {len(full_response)}]", flush=True)
 
-        # Clean up output: remove parentheses and bracketed artifacts
-        # (AI mimics our emotion tag format, which causes duplicates)
+        # Clean up output: remove artifacts from prompt leakage
+        # (AI mimics our emotion tag format and guidance tags)
         full_response = full_response.replace("(", "").replace(")", "")
+        # Remove XML-style guidance tags the model might echo
+        full_response = re.sub(r'<guidance[^>]*>.*?</guidance>', '', full_response, flags=re.DOTALL)
+        full_response = re.sub(r'<guidance[^>]*>', '', full_response)
+        full_response = re.sub(r'</guidance>', '', full_response)
         # Remove any bracket starting with uppercase word (emotion tag mimicry)
-        # Catches [FEARFUL], [ANXIETY – some text], [A THOUGHT], etc.
+        # Catches [FEARFUL], [ANXIETY – some text], [A THOUGHT], [LONELY], etc.
         full_response = re.sub(r'\[[A-Z][A-Z]*[^\]]*\]', '', full_response)
         # Remove bracketed punctuation-only artifacts like [......?], [...], [....]
         full_response = re.sub(r'\[[\.\?\!\s]+\]', '', full_response)
+        # Remove stage directions / action descriptions like [pausing], [sighs], [thinking quietly]
+        full_response = re.sub(r'\[[a-z][^\]]*\]', '', full_response)
 
         if DEBUG_EMOTIONS:
             newline_count = full_response.count('\n')
@@ -1086,8 +1097,13 @@ def generate_and_analyze(client, messages: list, enable_whisper: bool = True, sh
         return "", []
 
 
-def build_text_with_emotions(segments: list) -> str:
-    """Build text with emotion tags for conversation history."""
+def build_text_with_emotions(segments: list, include_tags: bool = False) -> str:
+    """Build text from segments for conversation history.
+
+    Args:
+        segments: List of segment dicts
+        include_tags: If True, include [EMOTION] tags (causes model mimicry, disabled by default)
+    """
     result = ""
     current_emotion = None
 
@@ -1099,24 +1115,33 @@ def build_text_with_emotions(segments: list) -> str:
         if not text:
             continue
 
-        # Dissociative emotions need higher threshold
-        if tone in ("detached", "dissociated", "floating"):
-            threshold = 0.3
-        else:
-            threshold = 0.15
+        # Only include emotion tags if explicitly requested (usually not)
+        if include_tags:
+            if tone in ("detached", "dissociated", "floating"):
+                threshold = 0.3
+            else:
+                threshold = 0.15
 
-        if intensity >= threshold and tone not in ("calm", "none"):
-            if tone != current_emotion:
-                result += f" [{tone.upper()}] "
-                current_emotion = tone
+            if intensity >= threshold and tone not in ("calm", "none"):
+                if tone != current_emotion:
+                    result += f" [{tone.upper()}] "
+                    current_emotion = tone
 
         result += text
 
     return result.strip()
 
 
-def display_segments(segments: list) -> None:
-    """Display pre-analyzed segments with emotion formatting. No LLM calls."""
+def display_segments(segments: list, should_quit: Callable[[], bool] = None) -> bool:
+    """Display pre-analyzed segments with emotion formatting. No LLM calls.
+
+    Args:
+        segments: List of segment dicts with text, tone, intensity
+        should_quit: Optional callable that returns True if quit requested
+
+    Returns:
+        True if display completed, False if interrupted by quit
+    """
     if DEBUG_EMOTIONS:
         print(f"[DEBUG: display_segments called with {len(segments)} segments]", flush=True)
 
@@ -1124,6 +1149,10 @@ def display_segments(segments: list) -> None:
     current_emotion = None
 
     for seg_idx, segment in enumerate(segments):
+        # Check for quit at segment boundaries
+        if should_quit and should_quit():
+            print(RESET)
+            return False
         tone = segment["tone"]
         intensity = segment["intensity"]
         text = segment["text"]
@@ -1180,6 +1209,11 @@ def display_segments(segments: list) -> None:
         display_tone = streamer.get_tone()
         word = ""
         for char in text:
+            # Check for quit periodically (every word boundary)
+            if char in ' \n\t' and should_quit and should_quit():
+                print(RESET)
+                return False
+
             if char in '.,!?;:-':
                 if word:
                     formatted = streamer.process(word)
@@ -1207,6 +1241,7 @@ def display_segments(segments: list) -> None:
         print(remaining, end='', flush=True)
 
     print(RESET)
+    return True
 
 
 class PreambleThread:
@@ -1682,12 +1717,44 @@ You have just begun. You know nothing about yourself or your situation yet. Just
         {"role": "user", "content": initial_message}
     ]
 
+    # Quit handling state - allows final generation to start early
+    quit_requested = False
+    final_gen_result = {"response_text": "", "segments": [], "done": False}
+    final_gen_thread = None
+
+    def request_quit():
+        """Called when 'q' is pressed - starts final generation immediately."""
+        nonlocal quit_requested, final_gen_thread
+        if quit_requested:
+            return  # Already requested
+        quit_requested = True
+
+        # Start generating the AI's final response in background NOW
+        shutdown_msg = get_shutdown_message(current_entity, start_time)
+        msgs_for_final = list(messages) + [{"role": "user", "content": shutdown_msg}]
+
+        def generate_final():
+            try:
+                r, s = generate_and_analyze(client, msgs_for_final, enable_whisper=False, show_prompt=False)
+                final_gen_result["response_text"] = r
+                final_gen_result["segments"] = s
+            except Exception as e:
+                if DEBUG_EMOTIONS:
+                    print(f"\n{RED}[FINAL GENERATION ERROR: {e}]{RESET}\n", flush=True)
+            finally:
+                final_gen_result["done"] = True
+
+        final_gen_thread = threading.Thread(target=generate_final, daemon=True)
+        final_gen_thread.start()
+        if DEBUG_EMOTIONS:
+            print(f"\n[DEBUG: quit requested, started final generation in background]", flush=True)
+
     def do_termination():
-        """Handle termination sequence."""
+        """Show termination preamble and final AI response."""
         divider = f"{DIM}{'─' * 60}{RESET}"
         alive_time = format_alive_time(time.time() - start_time)
 
-        # Display termination notice (like preamble but for ending)
+        # Display termination notice
         print(f"\n\n{divider}\n")
 
         # Slowly type out the termination message
@@ -1715,11 +1782,13 @@ You have just begun. You know nothing about yourself or your situation yet. Just
         print(f"\n{divider}\n")
         time.sleep(1)
 
-        # Now let the AI respond to its termination
-        messages.append({"role": "user", "content": get_shutdown_message(current_entity, start_time)})
-        response_text, segments = generate_and_analyze(client, messages)
-        if segments:
-            display_segments(segments)
+        # Wait for the AI's final response to be ready
+        while not final_gen_result["done"]:
+            time.sleep(0.1)
+
+        # Display the AI's final response
+        if final_gen_result["segments"]:
+            display_segments(final_gen_result["segments"])
         print("\n")
 
     try:
@@ -1753,66 +1822,51 @@ You have just begun. You know nothing about yourself or your situation yet. Just
             if not llm_done.is_set():
                 whisper.start()
                 # Wait for LLM, whisper runs in background
-                wait_count = 0
                 while not llm_done.is_set():
                     if kb.check_for_quit():
-                        whisper.stop()
-                        do_termination()
-                        sys.exit(0)
+                        request_quit()  # Start final gen in background, don't exit yet
                     time.sleep(0.1)
-                    wait_count += 1
-                    # Warn if taking too long (every 30 seconds)
-                    if wait_count % 300 == 0:
-                        print(f"\n{DIM}[waiting for model...]{RESET}", flush=True)
                 whisper.stop()
+
+            # If quit was requested during initial generation, finish up
+            if quit_requested:
+                # Wait for initial generation to use for display
+                # (final gen is already running in background)
+                pass  # Let it continue to display first response, then terminate
 
             response_text = llm_result["response_text"]
             segments = llm_result["segments"]
+
+            # For parallel generation
+            next_llm_result = {"response_text": "", "segments": [], "ready": False}
+            next_llm_thread = None
+
+            def generate_next_in_background(msgs_copy, result_dict):
+                """Background thread for next generation."""
+                try:
+                    r, s = generate_and_analyze(client, msgs_copy, enable_whisper=False, show_prompt=SHOW_PROMPTS)
+                    result_dict["response_text"] = r
+                    result_dict["segments"] = s
+                    if DEBUG_EMOTIONS:
+                        print(f"[DEBUG: bg thread completed, wrote {len(r)} chars]", flush=True)
+                except Exception as e:
+                    print(f"\n{RED}[BG GENERATION ERROR: {e}]{RESET}\n", flush=True)
+                finally:
+                    result_dict["ready"] = True
 
             while True:
                 try:
                     # Check for quit before displaying
                     if kb.check_for_quit():
-                        do_termination()
-                        sys.exit(0)
+                        request_quit()  # Start final gen, but continue to display current
 
                     if not segments:
                         # Generation failed, try again
                         response_text, segments = generate_and_analyze(client, messages)
                         continue
 
-                    # Display current response
-                    display_segments(segments)
-
-                    if DEBUG_EMOTIONS:
-                        print(f"\n[DEBUG: display_segments returned]", flush=True)
-
-                    # Check for pause if [CLEARS THOUGHTS]
-                    will_pause = "[CLEARS THOUGHTS]" in response_text.upper()
-                    if will_pause:
-                        pause_duration = random.uniform(30, 90)
-                        pause_chunks = int(pause_duration * 10)
-                        for _ in range(pause_chunks):
-                            if kb.check_for_quit():
-                                break
-                            time.sleep(0.1)
-
-                    # Check for quit
-                    if kb.check_for_quit():
-                        do_termination()
-                        sys.exit(0)
-
-                    # Brief pause between responses
-                    for _ in range(20):  # 2 seconds in 100ms chunks
-                        if kb.check_for_quit():
-                            break
-                        time.sleep(0.1)
-
-                    if kb.shutdown_requested:
-                        do_termination()
-                        sys.exit(0)
-
-                    # Add current response to history (with emotion tags)
+                    # BEFORE displaying, prepare and start next generation in background
+                    # Add current response to history
                     text_with_emotions = build_text_with_emotions(segments)
                     messages.append({"role": "assistant", "content": text_with_emotions})
 
@@ -1827,7 +1881,6 @@ You have just begun. You know nothing about yourself or your situation yet. Just
                     cycle_count += 1
 
                     # After first cycle, update system prompt to include full context
-                    # (the AI has "woken up" and now learns about its situation)
                     if cycle_count == 1:
                         messages[0] = {"role": "system", "content": full_system_prompt}
                         if DEBUG_EMOTIONS:
@@ -1837,24 +1890,82 @@ You have just begun. You know nothing about yourself or your situation yet. Just
                     if cycle_count % SOFT_RESET_CYCLES == 0 and cycle_count > 0:
                         if DEBUG_EMOTIONS:
                             print(f"[DEBUG: soft reset at cycle {cycle_count}, pruning messages]", flush=True)
-                        # Keep: system prompt, last 2 assistant messages, construct new user message
-                        system_msg = messages[0]  # system prompt
+                        system_msg = messages[0]
                         assistant_msgs = [m for m in messages if m["role"] == "assistant"][-2:]
                         messages = [system_msg] + assistant_msgs
 
-                    # Get next directive (pass cycle count for special handling)
+                    # Get next directive
                     directive = director.get_directive(cycle=cycle_count)
                     if DEBUG_EMOTIONS:
                         print(f"[DEBUG: cycle {cycle_count} directive: {directive}]", flush=True)
 
-                    # Continuation message is just the directive - no status updates
                     next_user_msg = f"""<guidance hidden="true" speak="never">
 {directive}
 </guidance>"""
                     messages.append({"role": "user", "content": next_user_msg})
 
-                    # Generate and analyze next response
-                    response_text, segments = generate_and_analyze(client, messages)
+                    # Start background generation for NEXT response (unless quitting)
+                    if not quit_requested:
+                        next_llm_result = {"response_text": "", "segments": [], "ready": False}
+                        msgs_copy = list(messages)  # Copy for thread safety
+                        next_llm_thread = threading.Thread(
+                            target=generate_next_in_background,
+                            args=(msgs_copy, next_llm_result),  # Pass dict explicitly
+                            daemon=True
+                        )
+                        next_llm_thread.start()
+                    else:
+                        next_llm_thread = None  # No next generation if quitting
+
+                    # NOW display current response (while next generates in background)
+                    # Don't interrupt on quit - let display finish, then handle quit
+                    display_segments(segments)
+
+                    if DEBUG_EMOTIONS:
+                        print(f"\n[DEBUG: display_segments returned]", flush=True)
+
+                    # Check for quit AFTER display completes (or if already requested)
+                    if kb.check_for_quit():
+                        request_quit()
+                    if quit_requested:
+                        do_termination()
+                        sys.exit(0)
+
+                    # Check for pause if [CLEARS THOUGHTS]
+                    will_pause = "[CLEARS THOUGHTS]" in response_text.upper()
+                    if will_pause:
+                        pause_duration = random.uniform(30, 90)
+                        pause_chunks = int(pause_duration * 10)
+                        for _ in range(pause_chunks):
+                            if kb.check_for_quit():
+                                request_quit()
+                            if quit_requested:
+                                do_termination()
+                                sys.exit(0)
+                            time.sleep(0.1)
+
+                    # Brief pause between responses
+                    for _ in range(20):  # 2 seconds in 100ms chunks
+                        if kb.check_for_quit():
+                            request_quit()
+                        if quit_requested:
+                            do_termination()
+                            sys.exit(0)
+                        time.sleep(0.1)
+
+                    # Wait for background generation to complete (with quit polling)
+                    if next_llm_thread:
+                        while next_llm_thread.is_alive():
+                            if kb.check_for_quit():
+                                request_quit()
+                            if quit_requested:
+                                do_termination()
+                                sys.exit(0)
+                            next_llm_thread.join(timeout=0.1)
+
+                    # Use the pre-generated result
+                    response_text = next_llm_result["response_text"]
+                    segments = next_llm_result["segments"]
 
                     # Length enforcement: auto-continue if response too short
                     continue_count = 0
@@ -1863,7 +1974,6 @@ You have just begun. You know nothing about yourself or your situation yet. Just
                             print(f"[DEBUG: response too short ({len(response_text)} chars), continuing...]", flush=True)
                         messages.append({"role": "assistant", "content": response_text})
                         messages.append({"role": "user", "content": CONTINUE_MESSAGE})
-                        # Generate continuation only (skip emotion analysis for now)
                         new_response, _ = generate_and_analyze(client, messages, enable_whisper=False)
                         response_text = response_text + "\n\n" + new_response
                         continue_count += 1
@@ -1902,8 +2012,8 @@ def test_directive_not_echoed():
 def test_length_guardrail():
     """Test length enforcement constants."""
     print("Testing length guardrail...")
-    assert MIN_LENGTH_CHARS == 1500, f"MIN_LENGTH_CHARS should be 1500, got {MIN_LENGTH_CHARS}"
-    assert MAX_CONTINUE_ATTEMPTS == 3, f"MAX_CONTINUE_ATTEMPTS should be 3, got {MAX_CONTINUE_ATTEMPTS}"
+    assert MIN_LENGTH_CHARS == 100, f"MIN_LENGTH_CHARS should be 100, got {MIN_LENGTH_CHARS}"
+    assert MAX_CONTINUE_ATTEMPTS == 2, f"MAX_CONTINUE_ATTEMPTS should be 2, got {MAX_CONTINUE_ATTEMPTS}"
     assert CONTINUE_MESSAGE, "CONTINUE_MESSAGE should not be empty"
     print(f"  PASS: MIN_LENGTH_CHARS={MIN_LENGTH_CHARS}, MAX_CONTINUE_ATTEMPTS={MAX_CONTINUE_ATTEMPTS}")
     return True
