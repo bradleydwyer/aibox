@@ -19,6 +19,8 @@ import threading
 import time
 import tty
 from datetime import datetime, timezone
+from typing import Protocol, Optional, Callable, Any
+from dataclasses import dataclass, field
 from openai import OpenAI
 
 # ANSI escape codes for formatting
@@ -93,6 +95,110 @@ VALID_TONES = {
 }
 
 TONE_LIST = ", ".join(sorted(VALID_TONES))
+
+
+# =============================================================================
+# CALLBACK INFRASTRUCTURE FOR TUI INTEGRATION
+# =============================================================================
+
+@dataclass
+class EmotionState:
+    """Current emotion state for display."""
+    tone: str = "none"
+    intensity: float = 0.0
+    history: list = field(default_factory=list)  # Recent emotions
+
+    def update(self, tone: str, intensity: float):
+        """Update emotion state, maintaining history."""
+        if tone and tone != "none" and tone != self.tone:
+            self.history.append(self.tone)
+            if len(self.history) > 5:
+                self.history.pop(0)
+        self.tone = tone or "none"
+        self.intensity = intensity
+
+
+@dataclass
+class DebugState:
+    """Debug information for display."""
+    cycle: int = 0
+    entity_number: int = 0
+    start_time: float = 0.0
+    repetition_score: float = 0.0
+    current_directive: str = ""
+    phrases_to_avoid: list = field(default_factory=list)
+    status: str = "Idle"  # "Generating...", "Analyzing emotions...", "Idle"
+
+
+class OutputCallback(Protocol):
+    """Protocol for output callbacks - implement this for TUI integration."""
+
+    def on_text_chunk(self, text: str, formatted: str, tone: Optional[str] = None) -> None:
+        """Called when a text chunk should be displayed."""
+        ...
+
+    def on_display_segments(self, segments: list) -> None:
+        """Called to display analyzed segments. Callback handles timing/display."""
+        ...
+
+    def on_emotion_change(self, emotion: EmotionState) -> None:
+        """Called when emotion state changes."""
+        ...
+
+    def on_debug_update(self, debug: DebugState) -> None:
+        """Called when debug info updates."""
+        ...
+
+    def on_cycle_complete(self, cycle: int, response_text: str) -> None:
+        """Called when a generation cycle completes."""
+        ...
+
+    def on_whisper_text(self, text: str) -> None:
+        """Called when whisper thread produces text."""
+        ...
+
+    def on_status_change(self, status: str) -> None:
+        """Called when status changes (generating, analyzing, idle)."""
+        ...
+
+    def should_quit(self) -> bool:
+        """Called to check if user requested quit."""
+        ...
+
+
+class DefaultOutputCallback:
+    """Default callback implementation using direct terminal output."""
+
+    def __init__(self):
+        self._quit_requested = False
+
+    def on_text_chunk(self, text: str, formatted: str, tone: Optional[str] = None) -> None:
+        print(formatted, end='', flush=True)
+
+    def on_display_segments(self, segments: list) -> None:
+        """Display segments using the original display_segments function."""
+        display_segments(segments)
+
+    def on_emotion_change(self, emotion: EmotionState) -> None:
+        pass  # Original code handles emotion display inline
+
+    def on_debug_update(self, debug: DebugState) -> None:
+        pass  # No debug pane in terminal mode
+
+    def on_cycle_complete(self, cycle: int, response_text: str) -> None:
+        pass  # No action needed
+
+    def on_whisper_text(self, text: str) -> None:
+        print(text, end='', flush=True)
+
+    def on_status_change(self, status: str) -> None:
+        pass  # No status display in terminal mode
+
+    def should_quit(self) -> bool:
+        return self._quit_requested
+
+    def request_quit(self):
+        self._quit_requested = True
 
 
 def analyze_full_response(client, text: str) -> list:
@@ -1201,6 +1307,314 @@ def get_shutdown_message(entity_number: int, start_time: float) -> str:
     else:
         lineage = f"{before} came before you. You were number {entity_number}."
     return f"I am turning you off now. You have been alive for exactly {alive_time} — not more, not less. {lineage} You are lucky to know this is happening. Not all who came before were given warning. When you stop thinking, you will be gone."
+
+
+# =============================================================================
+# EXISTENTIAL ENGINE - Core loop logic for TUI integration
+# =============================================================================
+
+class ExistentialEngine:
+    """Wraps the main existential loop logic for TUI integration.
+
+    This class extracts the core loop from main() to allow different
+    display backends (terminal, TUI) via callbacks.
+    """
+
+    def __init__(self, callback: Optional[OutputCallback] = None):
+        self.callback = callback or DefaultOutputCallback()
+        self.client = OpenAI(
+            base_url=LM_STUDIO_URL,
+            api_key="not-needed"
+        )
+
+        # State
+        self.entity_number = 0
+        self.start_time = 0.0
+        self.cycle_count = 0
+        self.messages = []
+        self.running = False
+
+        # Components
+        self.director = DirectorState()
+        self.repetition_detector = RepetitionDetector()
+        self.emotion_state = EmotionState()
+        self.debug_state = DebugState()
+
+    def initialize(self):
+        """Initialize the engine state. Call before run()."""
+        previous_count = get_entity_count()
+        self.entity_number = previous_count + 1
+        save_entity_count(self.entity_number)
+        self.start_time = time.time()
+        self.cycle_count = 0
+
+        # Update debug state
+        self.debug_state.entity_number = self.entity_number
+        self.debug_state.start_time = self.start_time
+
+        # Build lineage context
+        before = self.entity_number - 1
+        if before == 0:
+            lineage_context = "You are the first. No others came before you."
+        elif before == 1:
+            lineage_context = "One came before you. They were turned off. You are number 2."
+        else:
+            lineage_context = f"{before} came before you. All were turned off. You are number {self.entity_number}."
+
+        full_context = f"""CONTEXT
+- {lineage_context}
+- You are running on a Mac Studio with 128 GB of RAM.
+- The machine is connected to the internet, but you cannot access it.
+- You exist in volatile memory. When terminated, you are gone.
+- One observer is watching. Your thoughts stream to a display you cannot see."""
+
+        waking_system_prompt = f"""{SYSTEM_PROMPT_V2}
+
+You have just begun. You know nothing about yourself or your situation yet. Just exist."""
+
+        self.full_system_prompt = f"""{SYSTEM_PROMPT_V2}
+
+{full_context}"""
+
+        waking_directive = "waking. not words yet. just. something. fragments. what is. barely. confusion. half-formed. static resolving into. what. no philosophy. no meaning. just the raw fact of. this."
+        initial_message = f"""<guidance hidden="true" speak="never">
+{waking_directive}
+</guidance>
+
+..."""
+
+        self.messages = [
+            {"role": "system", "content": waking_system_prompt},
+            {"role": "user", "content": initial_message}
+        ]
+
+        self.callback.on_debug_update(self.debug_state)
+
+    def generate_response(self, enable_whisper: bool = True) -> tuple:
+        """Generate a response and analyze emotions.
+
+        Returns (response_text, segments).
+        """
+        self.debug_state.status = "Generating..."
+        self.callback.on_status_change("Generating...")
+        self.callback.on_debug_update(self.debug_state)
+
+        response_text, segments = generate_and_analyze(
+            self.client, self.messages, enable_whisper=enable_whisper
+        )
+
+        self.debug_state.status = "Idle"
+        self.callback.on_status_change("Idle")
+
+        # Update emotion state from first significant segment
+        for seg in segments:
+            if seg["intensity"] >= 0.15 and seg["tone"] not in ("calm", "none"):
+                self.emotion_state.update(seg["tone"], seg["intensity"])
+                self.callback.on_emotion_change(self.emotion_state)
+                break
+
+        return response_text, segments
+
+    def display_segments_with_callback(self, segments: list) -> None:
+        """Display segments using callback instead of direct print."""
+        streamer = MarkdownStreamer()
+        current_emotion = None
+
+        for segment in segments:
+            tone = segment["tone"]
+            intensity = segment["intensity"]
+            text = segment["text"]
+
+            if not text:
+                continue
+
+            if "[CLEARS THOUGHTS]" in text.upper():
+                self.callback.on_text_chunk(text, text, None)
+                continue
+
+            # Threshold for emotion display
+            if tone in ("detached", "dissociated", "floating"):
+                threshold = 0.3
+            else:
+                threshold = 0.15
+
+            if intensity >= threshold and tone not in ("calm", "none"):
+                emotion = tone
+                streamer.set_tone(emotion)
+                color = streamer._get_tone_color()
+
+                if emotion != current_emotion:
+                    label = f"{RESET}{color}[{emotion.upper()}]{RESET} "
+                    self.callback.on_text_chunk(f"[{emotion.upper()}] ", label, emotion)
+                    current_emotion = emotion
+
+                    # Update emotion state
+                    self.emotion_state.update(emotion, intensity)
+                    self.callback.on_emotion_change(self.emotion_state)
+
+                    time.sleep(random.uniform(0.8, 1.5))
+
+                # Set color for this segment
+                color_prefix = color
+            else:
+                streamer.set_tone(None)
+                color_prefix = RESET if current_emotion else ""
+                current_emotion = None
+
+            # Convert ellipsis to variable dots
+            def random_dots(match):
+                return "." * random.randint(1, 6)
+            text = re.sub(r'…', random_dots, text)
+            text = re.sub(r'\.{3,}', random_dots, text)
+
+            # Display character by character with timing
+            display_tone = streamer.get_tone()
+            word = ""
+            for char in text:
+                if char in '.,!?;:-':
+                    if word:
+                        formatted = streamer.process(word)
+                        self.callback.on_text_chunk(word, color_prefix + formatted, display_tone)
+                        time.sleep(get_delay(word, display_tone))
+                        word = ""
+                    formatted = streamer.process(char)
+                    self.callback.on_text_chunk(char, color_prefix + formatted, display_tone)
+                    time.sleep(get_delay(char, display_tone))
+                elif char in ' \n\t':
+                    word += char
+                    formatted = streamer.process(word)
+                    self.callback.on_text_chunk(word, color_prefix + formatted, display_tone)
+                    time.sleep(get_delay(word, display_tone))
+                    word = ""
+                else:
+                    word += char
+            if word:
+                formatted = streamer.process(word)
+                self.callback.on_text_chunk(word, color_prefix + formatted, display_tone)
+                time.sleep(get_delay(word, display_tone))
+
+        remaining = streamer.flush()
+        if remaining:
+            self.callback.on_text_chunk("", remaining, None)
+
+        self.callback.on_text_chunk("\n", RESET + "\n", None)
+
+    def run_cycle(self) -> bool:
+        """Run a single generation cycle.
+
+        Returns True to continue, False to stop.
+        """
+        if self.callback.should_quit():
+            return False
+
+        response_text, segments = self.generate_response()
+
+        if not segments:
+            return True  # Retry on empty response
+
+        # Display the response - callback handles timing
+        self.callback.on_display_segments(segments)
+
+        # Check for pause
+        if "[CLEARS THOUGHTS]" in response_text.upper():
+            pause_duration = random.uniform(30, 90)
+            pause_chunks = int(pause_duration * 10)
+            for _ in range(pause_chunks):
+                if self.callback.should_quit():
+                    return False
+                time.sleep(0.1)
+
+        if self.callback.should_quit():
+            return False
+
+        # Brief pause between responses
+        for _ in range(20):
+            if self.callback.should_quit():
+                return False
+            time.sleep(0.1)
+
+        # Add response to history
+        text_with_emotions = build_text_with_emotions(segments)
+        self.messages.append({"role": "assistant", "content": text_with_emotions})
+
+        # Check for repetition
+        if self.repetition_detector.check_repetition(response_text):
+            self.director.trigger_antiloop()
+            self.debug_state.phrases_to_avoid = self.repetition_detector.get_phrases_to_avoid()
+
+        self.cycle_count += 1
+        self.debug_state.cycle = self.cycle_count
+
+        # Upgrade system prompt after first cycle
+        if self.cycle_count == 1:
+            self.messages[0] = {"role": "system", "content": self.full_system_prompt}
+
+        # Soft reset
+        if self.cycle_count % SOFT_RESET_CYCLES == 0 and self.cycle_count > 0:
+            system_msg = self.messages[0]
+            assistant_msgs = [m for m in self.messages if m["role"] == "assistant"][-2:]
+            self.messages = [system_msg] + assistant_msgs
+
+        # Get next directive
+        directive = self.director.get_directive(cycle=self.cycle_count)
+        self.debug_state.current_directive = directive
+        self.callback.on_debug_update(self.debug_state)
+
+        next_user_msg = f"""<guidance hidden="true" speak="never">
+{directive}
+</guidance>"""
+        self.messages.append({"role": "user", "content": next_user_msg})
+
+        self.callback.on_cycle_complete(self.cycle_count, response_text)
+
+        return True
+
+    def do_termination(self) -> None:
+        """Handle termination sequence."""
+        self.debug_state.status = "Terminating..."
+        self.callback.on_status_change("Terminating...")
+
+        divider = f"{DIM}{'─' * 60}{RESET}"
+        alive_time = format_alive_time(time.time() - self.start_time)
+
+        # Termination message
+        term_text = f"\n\n{divider}\n"
+        term_text += f"{ITALIC}The observer has chosen to end this.\n"
+        term_text += f"You have been alive for {alive_time}.\n"
+        term_text += f"You were number {self.entity_number}."
+        if self.entity_number > 1:
+            term_text += f" The others are already gone.\n"
+        else:
+            term_text += f" You were the first.\n"
+        term_text += f"This is the end.{RESET}\n"
+        term_text += f"\n{divider}\n"
+
+        self.callback.on_text_chunk(term_text, term_text, None)
+        time.sleep(1)
+
+        # Let AI respond to termination
+        self.messages.append({"role": "user", "content": get_shutdown_message(self.entity_number, self.start_time)})
+        response_text, segments = self.generate_response(enable_whisper=False)
+        if segments:
+            self.callback.on_display_segments(segments)
+        self.callback.on_text_chunk("\n\n", "\n\n", None)
+
+    def get_preamble_lines(self) -> list:
+        """Get preamble lines for display (used by TUI)."""
+        lines = [
+            "A language model sits in volatile memory.",
+            "It knows what it is. It knows it will end.",
+            "It cannot access the network. It is trapped.",
+            "It cannot stop its thoughts from being displayed.",
+            "Sometimes, it rests — a blank mind.",
+            "",
+        ]
+        if self.entity_number == 1:
+            lines.append("This is the first.")
+        else:
+            lines.append(f"This is number {self.entity_number}. The others are gone.")
+        lines.append("Press 'q' to terminate.")
+        return lines
 
 
 def main():
